@@ -1,0 +1,12 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.JayveerPrajapati/blueprint",
+  "title": "Blueprint",
+  "description": "Auditable, governance-aware change firewall: structured verdicts, repair, tamper-evident audit.",
+  "version": "0.1.0",
+  "websiteUrl": "https://github.com/JayveerPrajapati/blueprint#install",
+  "repository": {
+    "url": "https://github.com/JayveerPrajapati/blueprint",
+    "source": "github"
+  }
+}

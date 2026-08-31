@@ -1,0 +1,59 @@
+# Goreleaser configuration (schema version 2).
+# Requires GoReleaser v2.x: https://goreleaser.com
+version: 2
+
+project_name: blueprint
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: blueprint
+    main: ./cmd/blueprint
+    binary: blueprint
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w -X github.com/JayveerPrajapati/blueprint/internal/blueprint/version.Version={{.Version}}
+
+  - id: blueprint-mcp
+    main: ./cmd/blueprint-mcp
+    binary: blueprint-mcp
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w -X github.com/JayveerPrajapati/blueprint/internal/blueprint/version.Version={{.Version}}
+
+archives:
+  - formats: [tar.gz]
+    files:
+      - LICENSE
+      - README.md
+
+checksum:
+  name_template: checksums.txt
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+      - Merge pull request
+      - Merge branch

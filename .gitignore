@@ -1,0 +1,58 @@
+# Build artifacts
+/bin/
+/dist/
+*.exe
+*.test
+*.out
+
+# Go workspace
+go.work
+go.work.sum
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Blueprint runtime
+.blueprint/
+# Generated audit trail (never commit; config under .blueprint/ may be tracked)
+.blueprint/audit/
+
+# kern runtime artifacts (AST index, audit log, sqlite)
+**/.kern/*
+!.kern/boundaries.json
+
+# tool-generated dirs
+.cortexkit/
+
+# --- kern generated (agent wiring, machine-specific) ---
+# Re-run `kern setup` to refresh. Unignore a line to commit shared config.
+.mcp.json
+.claude/
+.cursor/
+.gemini/
+.kiro/
+**/.kern/*
+# .kern/boundaries.json is shared architecture config — must be tracked so
+# blueprint/kern guard can self-enforce (unignored here).
+!.kern/boundaries.json
+.continue/
+.windsurf/
+.opencode/node_modules/
+.opencode/package-lock.json
+CLAUDE.md
+GEMINI.md
+.github/copilot-instructions.md
+.github/hooks/
+
+# Root-level build artifacts
+/blueprint
+/blueprint-mcp
+# opencode machine wiring
+.opencode/
+opencode.json

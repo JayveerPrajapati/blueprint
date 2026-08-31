@@ -1,0 +1,11 @@
+{
+  "rules": [
+    {"from": "cmd/blueprint", "to": "internal/blueprint", "action": "allow"},
+    {"from": "cmd/blueprint-mcp", "to": "internal/blueprint", "action": "allow"},
+    {"from": "internal/blueprint/checks", "to": "internal/blueprint/adapters", "action": "allow"},
+    {"from": "internal/blueprint/adapters", "to": "internal/blueprint/checks", "action": "forbid"},
+    {"from": "internal/blueprint/adapters/jscpd", "to": "internal/blueprint/checks/duplication", "action": "allow"},
+    {"from": "internal/blueprint/mcp", "to": "internal/blueprint/service", "action": "allow"},
+    {"from": "internal/blueprint/service", "to": "internal/blueprint/mcp", "action": "forbid"}
+  ]
+}

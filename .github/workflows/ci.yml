@@ -1,0 +1,64 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build-test:
+    name: Build, vet, fmt, tidy, unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Install gitleaks
+        # The secret check delegates to gitleaks (incumbent) and falls back to
+        # the in-house kern sec scanner with a WARN when gitleaks is absent.
+        # Several gate tests (G5, P12, G11_CleanPR) expect a clean PASS, so
+        # gitleaks must be on $PATH.
+        run: |
+          go install github.com/gitleaks/gitleaks/v8/cmd/gitleaks@latest
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+      - name: Build
+        run: go build ./...
+      - name: Vet
+        run: go vet ./...
+      - name: gofmt
+        run: test -z "$(gofmt -l . | tee /dev/stderr)"
+      - name: go mod tidy
+        run: go mod tidy && git diff --exit-code -- go.mod go.sum
+      - name: Test
+        # Gate tests (incl. ./cmd/blueprint) skip gracefully when kern is
+        # unavailable: requireKernPath t.Skips when there is no KERN_BINARY,
+        # no kern on PATH, and no ../kern/bin/kern (true in this standalone
+        # checkout); the non-gate unit tests still run.
+        run: go test -count=1 ./internal/... ./cmd/blueprint ./cmd/blueprint-mcp
+
+  gates:
+    name: Gate suite (with kern)
+    runs-on: ubuntu-latest
+    needs: [build-test]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      # Pull the latest kern straight from the repo — no clone, no local build.
+      # NOTE: once kern v0.9.0 ships with the guard/sec commands, replace this
+      # step with the prebuilt release asset:
+      #   curl -fsSL -o /tmp/kern.tar.gz https://github.com/JayveerPrajapati/kern/releases/latest/download/kern-linux-amd64.tar.gz
+      #   tar -xzf /tmp/kern.tar.gz -C /tmp
+      #   echo "/tmp/kern-linux-amd64" >> "$GITHUB_PATH"
+      - name: Pull latest kern from repo
+        run: |
+          go install github.com/JayveerPrajapati/kern@main
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+      - name: Install gitleaks
+        run: |
+          go install github.com/gitleaks/gitleaks/v8/cmd/gitleaks@latest
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+      - name: Gate tests (G0-G13 with real kern)
+        run: go test -count=1 -timeout 600s ./cmd/blueprint ./internal/blueprint/adapters/kern ./internal/blueprint/metrics

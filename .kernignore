@@ -1,0 +1,20 @@
+# docs/ci-guide.md documents the blueprint-result.json schema with a real
+# example finding whose rule_id ("secret:hardcoded-secret") legitimately trips
+# kern's TOKEN detector. The file is documentation of the artifact schema, not
+# source; excluding it keeps the doc's truthful example intact. Other docs
+# remain scanned.
+docs/ci-guide.md
+
+# gitleaks/check.go contains rule-ID strings like "secret:incumbent-unavailable"
+# that trip kern's TOKEN detector. This is source code referencing rule IDs, not
+# actual secrets.
+internal/blueprint/adapters/gitleaks/check.go
+
+# Action README contains @v0.1.0 version refs that trip kern's EMAIL detector.
+.github/actions/blueprint-ci/README.md
+
+# README.md documents the reusable action with an @v0.1.0 version ref (the
+# first release tag); "blueprint-ci@v0.1.0" trips kern's EMAIL detector because
+# the version part starts with a letter (v), which the version-like filter does
+# not recognize. Documentation of the tag convention, not a secret.
+README.md

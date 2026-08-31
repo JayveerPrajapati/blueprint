@@ -1,0 +1,109 @@
+name: Blueprint CI
+description: >-
+  Runs the blueprint change-governance gate (architecture boundaries,
+  secrets, duplication) against a repository via `blueprint ci` and uploads
+  the JSON result artifact when the gate fails. Builds blueprint and kern
+  from source at the given refs; prebuilt release assets replace the source
+  build once kern v0.9.0 ships (see the ci.yml NOTE in this repo).
+author: blueprint
+branding:
+  icon: shield
+  color: blue
+inputs:
+  repo:
+    description: Path to the target repository, relative to the workspace root.
+    required: true
+    default: .
+  blueprint-ref:
+    description: Git ref of JayveerPrajapati/blueprint to build blueprint from.
+    required: false
+    default: main
+  kern-ref:
+    description: Git ref of JayveerPrajapati/kern to build kern from.
+    required: false
+    default: main
+  go-version:
+    description: Go toolchain version used to build blueprint and kern.
+    required: false
+    default: "1.27"
+  base:
+    description: Base revision passed to `blueprint ci`.
+    required: false
+    default: main
+  head:
+    description: Proposed revision passed to `blueprint ci`.
+    required: false
+    default: HEAD
+  extra-args:
+    description: Extra flags for `blueprint ci` (e.g. `--resilience`).
+    required: false
+    default: ""
+  artifact-file:
+    description: Path where blueprint writes its JSON result (relative to the workflow workspace).
+    required: false
+    default: blueprint-result.json
+  artifact-name:
+    description: Name of the uploaded artifact when the gate fails.
+    required: false
+    default: blueprint-ci-result
+runs:
+  using: composite
+  steps:
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: ${{ inputs.go-version }}
+
+    - name: Install kern
+      shell: bash
+      run: |
+        go install github.com/JayveerPrajapati/kern@${{ inputs.kern-ref }}
+        echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+    - name: Install gitleaks
+      # The secret check delegates to gitleaks (incumbent) and falls back to
+      # the in-house kern sec scanner with a WARN when gitleaks is absent.
+      # Install it so consumer repos get full secret-rule coverage without a
+      # fallback WARN on every run.
+      shell: bash
+      run: |
+        go install github.com/gitleaks/gitleaks/v8/cmd/gitleaks@latest
+        echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+    - name: Install blueprint
+      shell: bash
+      run: go install github.com/JayveerPrajapati/blueprint/cmd/blueprint@${{ inputs.blueprint-ref }}
+
+    - name: Run blueprint ci
+      id: ci
+      shell: bash
+      run: |
+        set +e
+        blueprint ci \
+          --repo "${{ inputs.repo }}" \
+          --base "${{ inputs.base }}" \
+          --head "${{ inputs.head }}" \
+          --artifact-file "${{ inputs.artifact-file }}" \
+          ${{ inputs.extra-args }}
+        code=$?
+        echo "exit-code=$code" >> "$GITHUB_OUTPUT"
+        exit 0
+
+    - name: Upload result artifact on failure
+      if: steps.ci.outputs.exit-code != '0'
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ inputs.artifact-name }}
+        path: ${{ inputs.artifact-file }}
+        if-no-files-found: ignore
+
+    - name: Verify tamper-evident receipt
+      if: steps.ci.outputs.exit-code == '0'
+      shell: bash
+      run: |
+        blueprint verify-receipt --repo "${{ inputs.repo }}"
+
+    - name: Fail on gate result
+      if: steps.ci.outputs.exit-code != '0'
+      shell: bash
+      run: exit ${{ steps.ci.outputs.exit-code }}
