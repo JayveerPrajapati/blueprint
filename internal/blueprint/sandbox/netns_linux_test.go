@@ -21,11 +21,15 @@ import (
 // which also surfaces as a failed (non-Ok) run — so the core assertion below
 // (an isolated run never succeeds) holds in both environments.
 func TestSandboxNetworkIsolationLinux(t *testing.T) {
-	// Mechanism: the SysProcAttr must carry CLONE_NEWNET.
+	// Mechanism: the SysProcAttr must carry CLONE_NEWNET — but only when the
+	// platform actually supports it. In restricted environments (no
+	// CAP_SYS_ADMIN / unprivileged user namespaces) the probe reports
+	// unavailable and applyNetworkIsolation falls back to a visible warning
+	// instead of setting the clone flag, so the flag cannot be asserted there.
 	cmd := exec.Command("true")
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	applyNetworkIsolation(cmd)
-	if cmd.SysProcAttr.Cloneflags&syscall.CLONE_NEWNET == 0 {
+	if networkIsolationAvailable() && cmd.SysProcAttr.Cloneflags&syscall.CLONE_NEWNET == 0 {
 		t.Fatalf("expected CLONE_NEWNET in Cloneflags, got %x", cmd.SysProcAttr.Cloneflags)
 	}
 

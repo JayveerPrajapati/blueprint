@@ -3,6 +3,8 @@
 package sandbox
 
 import (
+	"fmt"
+	"os"
 	"os/exec"
 	"sync"
 	"syscall"
@@ -14,8 +16,20 @@ import (
 //
 // Requires CAP_SYS_ADMIN in the caller's user namespace (typically root). If
 // the caller lacks the capability, cmd.Start fails with EPERM, which surfaces
-// as a sandbox error rather than running the command unisolated.
+// as a sandbox error rather than running the command unisolated. When
+// CLONE_NEWNET is unavailable (probe failed), the caller must have explicitly
+// opted into an unisolated run (AllowUnisolated) to reach this point — we
+// print a clear warning and continue WITHOUT isolation instead of setting the
+// clone flag, so the override path works. The warning keeps the override
+// visible, never a silent downgrade.
 func applyNetworkIsolation(cmd *exec.Cmd) {
+	if !networkIsolationAvailable() {
+		// Run() fail-closes before this when isolation was requested without
+		// AllowUnisolated, so reaching here means the caller explicitly opted
+		// into an unisolated run. Warn — never a silent downgrade.
+		fmt.Fprintf(os.Stderr, "blueprint: warning: CLONE_NEWNET network isolation is not available here (requires CAP_SYS_ADMIN or unprivileged user namespaces); continuing WITHOUT network isolation\n")
+		return
+	}
 	if cmd.SysProcAttr == nil {
 		cmd.SysProcAttr = &syscall.SysProcAttr{}
 	}

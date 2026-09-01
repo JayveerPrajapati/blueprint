@@ -25,6 +25,10 @@ func makeRepo(t *testing.T, fileCount int) string {
 	runGit(t, dir, "init", "-q")
 	runGit(t, dir, "config", "user.email", "t@t")
 	runGit(t, dir, "config", "user.name", "t")
+	// Disable auto-maintenance so a detached git process doesn't keep writing
+	// to .git/objects after the test body returns, racing t.TempDir() cleanup.
+	runGit(t, dir, "config", "maintenance.auto", "false")
+	runGit(t, dir, "config", "gc.auto", "0")
 	writeFile(t, dir, "go.mod", "module example.com/repo\n\ngo 1.23\n")
 	for i := 0; i < fileCount; i++ {
 		path := fmt.Sprintf("pkg%d/file%d.go", i/10, i)

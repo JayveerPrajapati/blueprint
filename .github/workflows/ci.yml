@@ -19,8 +19,13 @@ jobs:
         # the in-house kern sec scanner with a WARN when gitleaks is absent.
         # Several gate tests (G5, P12, G11_CleanPR) expect a clean PASS, so
         # gitleaks must be on $PATH.
+        #
+        # The v8 module declares its path as github.com/zricethezav/gitleaks/v8
+        # (not github.com/gitleaks/gitleaks/v8), so the package must be
+        # installed via that declared path. `go install ...gitleaks` (the alias
+        # module) fails with a "version constraints conflict" error.
         run: |
-          go install github.com/gitleaks/gitleaks/v8@latest
+          go install github.com/zricethezav/gitleaks/v8@latest
           echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
       - name: Build
         run: go build ./...
@@ -58,7 +63,7 @@ jobs:
           echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
       - name: Install gitleaks
         run: |
-          go install github.com/gitleaks/gitleaks/v8@latest
+          go install github.com/zricethezav/gitleaks/v8@latest
           echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
       - name: Gate tests (G0-G13 with real kern)
         run: go test -count=1 -timeout 600s ./cmd/blueprint ./internal/blueprint/adapters/kern ./internal/blueprint/metrics
