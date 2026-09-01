@@ -10,8 +10,8 @@ jobs:
     name: Build, vet, fmt, tidy, unit tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
       - name: Install gitleaks
@@ -20,7 +20,7 @@ jobs:
         # Several gate tests (G5, P12, G11_CleanPR) expect a clean PASS, so
         # gitleaks must be on $PATH.
         run: |
-          go install github.com/gitleaks/gitleaks/v8/cmd/gitleaks@latest
+          go install github.com/gitleaks/gitleaks/v8@latest
           echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
       - name: Build
         run: go build ./...
@@ -42,8 +42,8 @@ jobs:
     runs-on: ubuntu-latest
     needs: [build-test]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
       # Pull the latest kern straight from the repo — no clone, no local build.
@@ -54,11 +54,11 @@ jobs:
       #   echo "/tmp/kern-linux-amd64" >> "$GITHUB_PATH"
       - name: Pull latest kern from repo
         run: |
-          go install github.com/JayveerPrajapati/kern@main
+          go install github.com/JayveerPrajapati/kern/cmd/kern@main
           echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
       - name: Install gitleaks
         run: |
-          go install github.com/gitleaks/gitleaks/v8/cmd/gitleaks@latest
+          go install github.com/gitleaks/gitleaks/v8@latest
           echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
       - name: Gate tests (G0-G13 with real kern)
         run: go test -count=1 -timeout 600s ./cmd/blueprint ./internal/blueprint/adapters/kern ./internal/blueprint/metrics

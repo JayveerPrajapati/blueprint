@@ -27,7 +27,7 @@ func applyNetworkIsolation(cmd *exec.Cmd) {
 // and namespace restrictions are set at login/container start).
 var (
 	netnsProbeOnce sync.Once
-	netnsAvailable  bool
+	netnsAvailable bool
 )
 
 // probeNetworkIsolation tries to start a trivial process in a new network

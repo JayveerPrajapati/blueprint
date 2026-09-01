@@ -50,14 +50,14 @@ runs:
   using: composite
   steps:
     - name: Set up Go
-      uses: actions/setup-go@v5
+      uses: actions/setup-go@v7
       with:
         go-version: ${{ inputs.go-version }}
 
     - name: Install kern
       shell: bash
       run: |
-        go install github.com/JayveerPrajapati/kern@${{ inputs.kern-ref }}
+        go install github.com/JayveerPrajapati/kern/cmd/kern@${{ inputs.kern-ref }}
         echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
 
     - name: Install gitleaks
@@ -67,7 +67,7 @@ runs:
       # fallback WARN on every run.
       shell: bash
       run: |
-        go install github.com/gitleaks/gitleaks/v8/cmd/gitleaks@latest
+        go install github.com/gitleaks/gitleaks/v8@latest
         echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
 
     - name: Install blueprint
