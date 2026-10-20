@@ -4,7 +4,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strings"
 	"testing"
 )
 
@@ -36,8 +35,10 @@ func blueprintModRoot(t *testing.T) string {
 	return ""
 }
 
-// buildBlueprintBinary builds the blueprint CLI binary once and caches its
-// path. Tests that need the CLI call this to get the binary path.
+// buildBlueprintBinary builds the merged kern binary once and caches its
+// path (the standalone blueprint binary was declared redundant: kern check
+// forwards to the same internal/blueprint/cli implementation). Tests that
+// need the CLI call this to get the binary path.
 func buildBlueprintBinary(t *testing.T) string {
 	t.Helper()
 	if blueprintBinPath != "" {
@@ -46,50 +47,33 @@ func buildBlueprintBinary(t *testing.T) string {
 		}
 	}
 	binDir := t.TempDir()
-	binPath := filepath.Join(binDir, "blueprint")
-	cmd := exec.Command("go", "build", "-buildvcs=false", "-o", binPath, "./cmd/blueprint")
+	binPath := filepath.Join(binDir, "kern")
+	cmd := exec.Command("go", "build", "-buildvcs=false", "-o", binPath, "./cmd/kern")
 	cmd.Dir = blueprintModRoot(t)
 	if out, err := cmd.CombinedOutput(); err != nil {
-		t.Fatalf("build blueprint binary: %v\n%s", err, out)
+		t.Fatalf("build kern binary: %v\n%s", err, out)
 	}
 	blueprintBinPath = binPath
 	return binPath
 }
 
-// runBlueprintCheck runs `blueprint check` with the given args against repo
+// runBlueprintCheck runs `kern check` with the given args against repo
 // and returns (combined output, exit code).
 func runBlueprintCheck(t *testing.T, binPath, repo string, extraArgs ...string) (string, int) {
 	t.Helper()
 	args := append([]string{"check", "--repo", repo}, extraArgs...)
 	cmd := exec.Command(binPath, args...)
-	// Ensure the kern binary is discoverable by the blueprint subprocess.
-	// KERN_BINARY is inherited from the test env if set; otherwise blueprint
-	// resolves via $PATH or ../kern/bin/kern.
+	// Ensure the kern binary is discoverable by the check subprocess.
+	// KERN_BINARY is inherited from the test env if set; otherwise kern
+	// resolves via  or ../kern/bin/kern.
 	out, err := cmd.CombinedOutput()
 	code := 0
 	if err != nil {
 		if exitErr, ok := err.(*exec.ExitError); ok {
 			code = exitErr.ExitCode()
 		} else {
-			t.Fatalf("run blueprint check: %v\n%s", err, out)
+			t.Fatalf("run kern check: %v\n%s", err, out)
 		}
 	}
 	return string(out), code
-}
-
-// ensureStaged verifies that the fixture's staged files are actually staged
-// in git (defensive — catches fixture materialization bugs).
-func ensureStaged(t *testing.T, repo string, expected []string) {
-	t.Helper()
-	cmd := exec.Command("git", "-C", repo, "diff", "--cached", "--name-only")
-	out, err := cmd.Output()
-	if err != nil {
-		t.Fatalf("git diff --cached --name-only: %v", err)
-	}
-	staged := strings.TrimSpace(string(out))
-	for _, f := range expected {
-		if !strings.Contains(staged, f) {
-			t.Fatalf("fixture bug: %s not staged; staged files:\n%s", f, staged)
-		}
-	}
 }

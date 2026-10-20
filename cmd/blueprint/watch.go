@@ -11,13 +11,13 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/JayveerPrajapati/blueprint/internal/blueprint/adapters/gitleaks"
-	"github.com/JayveerPrajapati/blueprint/internal/blueprint/adapters/jscpd"
 	"github.com/JayveerPrajapati/blueprint/internal/blueprint/adapters/kern"
 	"github.com/JayveerPrajapati/blueprint/internal/blueprint/domain"
-	"github.com/JayveerPrajapati/blueprint/internal/blueprint/policy"
 	"github.com/JayveerPrajapati/blueprint/internal/blueprint/service"
 	"github.com/JayveerPrajapati/blueprint/internal/blueprint/watcher"
+	"github.com/JayveerPrajapati/blueprint/internal/bppolicy/policy"
+	"github.com/JayveerPrajapati/blueprint/internal/scanners/gitleaks"
+	"github.com/JayveerPrajapati/blueprint/internal/scanners/jscpd"
 )
 
 // runWatch implements `blueprint watch` — the continuous watcher daemon.

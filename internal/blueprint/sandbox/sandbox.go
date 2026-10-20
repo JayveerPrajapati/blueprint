@@ -70,12 +70,40 @@ type Config struct {
 	// is still printed to stderr. No effect when isolation is available or
 	// was not requested. Opt-in; default OFF.
 	AllowUnisolated bool
+
+	// Matrix defines an optional polyglot build/test matrix.
+	Matrix []MatrixTarget
+}
+
+// MatrixTarget defines one target component in a polyglot build/test matrix.
+type MatrixTarget struct {
+	Name    string   `json:"name"`
+	Dir     string   `json:"dir"`     // relative to repo root, default "."
+	Build   []string `json:"build"`   // build command argv
+	Test    []string `json:"test"`    // test command argv
+	Command []string `json:"command"` // combined command argv
+}
+
+// WithMatrix sets the polyglot build/test matrix.
+func WithMatrix(matrix []MatrixTarget) ConfigOption {
+	return func(c *Config) { c.Matrix = matrix }
+}
+
+// WithTimeout sets the execution timeout.
+func WithTimeout(d time.Duration) ConfigOption {
+	return func(c *Config) { c.Timeout = d }
 }
 
 // DefaultConfig returns safe defaults: 120s timeout, 1MiB output cap.
 func DefaultConfig() Config {
+	timeout := 120 * time.Second
+	if env := os.Getenv("BLUEPRINT_SANDBOX_TIMEOUT"); env != "" {
+		if d, err := time.ParseDuration(env); err == nil && d > 0 {
+			timeout = d
+		}
+	}
 	return Config{
-		Timeout:        120 * time.Second,
+		Timeout:        timeout,
 		MaxOutputBytes: 1 << 20, // 1 MiB
 	}
 }
@@ -83,59 +111,49 @@ func DefaultConfig() Config {
 // Run executes the given command in an isolated git worktree of repoRoot.
 // The worktree is created at a temp path, the command runs there, and the
 // worktree is removed afterward. The main repo is never touched.
-//
-// The command runs in its own process group so it can be killed cleanly on
-// timeout or cancellation (spec: "process cleanup", "cancellation behavior").
-//
-// If cfg.Timeout > 0, a child context with that deadline is derived from ctx.
-// This ensures the timeout is enforced even when the caller passes a
-// non-expiring context (e.g. context.Background()).
 func Run(ctx context.Context, repoRoot string, command []string, cfg Config) Result {
+	worktreePath, cleanup, err := createWorktree(repoRoot)
+	if err != nil {
+		return Result{
+			Command: strings.Join(command, " "),
+			Error:   fmt.Sprintf("create worktree: %v", err),
+		}
+	}
+	defer cleanup()
+
+	r := RunInWorktree(ctx, worktreePath, "", command, cfg)
+	r.Worktree = worktreePath
+	return r
+}
+
+// RunInWorktree executes command in an existing worktree directory (or a subdirectory).
+func RunInWorktree(ctx context.Context, worktreePath, subDir string, command []string, cfg Config) Result {
 	start := time.Now()
-	result := Result{Command: strings.Join(command, " ")}
+	result := Result{Command: strings.Join(command, " "), Worktree: worktreePath}
 
 	if len(command) == 0 {
 		result.Error = "no command specified"
 		return result
 	}
 
-	// Fail-closed gate (P0.3): when network isolation is explicitly requested
-	// but this platform cannot provide it, refuse to run unless the caller
-	// explicitly opts into an unisolated run with AllowUnisolated. A
-	// governance tool must never silently downgrade a requested safety
-	// control to a warning — the override path is the only way to run
-	// unisolated, and it still emits a visible warning to stderr.
 	if cfg.NetworkIsolated && !networkIsolationAvailable() && !cfg.AllowUnisolated {
 		result.Error = "network isolation requested but unavailable on this platform; use --allow-unisolated to override"
 		return result
 	}
 
-	// Apply the config timeout to the context.
 	if cfg.Timeout > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, cfg.Timeout)
 		defer cancel()
 	}
 
-	// Create an isolated git worktree.
-	worktreePath, cleanup, err := createWorktree(repoRoot)
-	if err != nil {
-		result.Error = fmt.Sprintf("create worktree: %v", err)
-		return result
+	dir := worktreePath
+	if subDir != "" && subDir != "." {
+		dir = filepath.Join(worktreePath, subDir)
 	}
-	result.Worktree = worktreePath
-	defer cleanup()
 
-	// Set up the command with process group isolation.
-	// We use exec.Command (not CommandContext) and manage the context
-	// ourselves, because CommandContext only kills the direct process — not
-	// the process group. When running `go run` or `go test`, the go tool
-	// spawns child processes that inherit our stdout/stderr pipes; killing
-	// only the parent leaves the children alive, holding the pipes open, and
-	// cmd.Wait() blocks until they exit. By killing the entire process group
-	// on timeout/cancel, we ensure the pipes close and Wait returns promptly.
 	cmd := exec.Command(command[0], command[1:]...)
-	cmd.Dir = worktreePath
+	cmd.Dir = dir
 	cmd.Env = sanitizedEnv(cfg.Env)
 	setProcessGroup(cmd)
 
@@ -222,6 +240,32 @@ func Run(ctx context.Context, repoRoot string, command []string, cfg Config) Res
 
 // createWorktree creates a detached git worktree of repoRoot at a temp path.
 // Returns the worktree path and a cleanup function.
+// applyStagedDiff applies repoRoot's staged diff (HEAD -> index) to the
+// sandbox worktree, so build/test commands validate the tree the commit
+// would produce rather than the last committed tree (createWorktree checks
+// out HEAD only). Nothing staged is a no-op. Fail-closed: any git error
+// aborts with a non-nil error — the caller reports ERROR and never runs
+// commands against a partial application.
+func applyStagedDiff(repoRoot, worktreePath string) error {
+	diff := exec.Command("git", "diff", "--cached", "--binary", "HEAD")
+	diff.Dir = repoRoot
+	var buf bytes.Buffer
+	diff.Stdout = &buf
+	if err := diff.Run(); err != nil {
+		return fmt.Errorf("git diff --cached HEAD: %w", err)
+	}
+	if buf.Len() == 0 {
+		return nil
+	}
+	apply := exec.Command("git", "apply", "--binary", "-")
+	apply.Dir = worktreePath
+	apply.Stdin = &buf
+	if out, err := apply.CombinedOutput(); err != nil {
+		return fmt.Errorf("git apply: %w: %s", err, truncateForEvidence(string(out), 200))
+	}
+	return nil
+}
+
 func createWorktree(repoRoot string) (string, func(), error) {
 	tmpDir, err := os.MkdirTemp("", "blueprint-sandbox-")
 	if err != nil {
@@ -229,25 +273,34 @@ func createWorktree(repoRoot string) (string, func(), error) {
 	}
 	worktreePath := filepath.Join(tmpDir, "work")
 
-	// Create a worktree from the current HEAD.
-	cmd := exec.Command("git", "worktree", "add", "--detach", worktreePath, "HEAD")
-	cmd.Dir = repoRoot
-	if out, err := cmd.CombinedOutput(); err != nil {
-		os.RemoveAll(tmpDir)
-		return "", nil, fmt.Errorf("git worktree add: %w: %s", err, string(out))
+	// Create a worktree from the current HEAD with retries under lock contention.
+	var out []byte
+	var cmdErr error
+	for attempt := 0; attempt < 5; attempt++ {
+		cmd := exec.Command("git", "worktree", "add", "--detach", worktreePath, "HEAD")
+		cmd.Dir = repoRoot
+		out, cmdErr = cmd.CombinedOutput()
+		if cmdErr == nil {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if cmdErr != nil {
+		_ = os.RemoveAll(tmpDir)
+		return "", nil, fmt.Errorf("git worktree add: %w: %s", cmdErr, string(out))
 	}
 
 	cleanup := func() {
 		// Remove the worktree registration from the main repo.
 		rmCmd := exec.Command("git", "worktree", "remove", "--force", worktreePath)
 		rmCmd.Dir = repoRoot
-		rmCmd.Run() // best-effort
+		_ = rmCmd.Run() // best-effort
 		// Also prune stale worktree metadata.
 		pruneCmd := exec.Command("git", "worktree", "prune")
 		pruneCmd.Dir = repoRoot
-		pruneCmd.Run()
+		_ = pruneCmd.Run()
 		// Remove the temp dir.
-		os.RemoveAll(tmpDir)
+		_ = os.RemoveAll(tmpDir)
 	}
 
 	return worktreePath, cleanup, nil

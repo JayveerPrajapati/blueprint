@@ -5,7 +5,8 @@ import (
 	"fmt"
 	"os"
 
-	blueprintversion "github.com/JayveerPrajapati/blueprint/internal/blueprint/version"
+	"github.com/JayveerPrajapati/blueprint/internal/bpcli/cli"
+	blueprintversion "github.com/JayveerPrajapati/blueprint/internal/bpreceipt/version"
 )
 
 var version = blueprintversion.Version
@@ -13,7 +14,7 @@ var version = blueprintversion.Version
 func main() {
 	if len(os.Args) < 2 {
 		usage(os.Stderr)
-		os.Exit(2)
+		os.Exit(0)
 	}
 
 	cmd, args := os.Args[1], os.Args[2:]
@@ -21,34 +22,36 @@ func main() {
 	switch cmd {
 	case "version", "--version", "-v", "-version":
 		fmt.Printf("blueprint %s\n", version)
-	case "doctor":
-		os.Exit(runDoctor(args))
-	case "help", "--help", "-h":
-		usage(os.Stdout)
-	case "check":
-		os.Exit(runCheck(args))
-	case "fix":
-		os.Exit(runFix(args))
-	case "install":
-		os.Exit(runInstall(args))
 	case "watch":
 		os.Exit(runWatch(args))
+	case "help", "--help", "-h":
+		usage(os.Stdout)
+	case "doctor":
+		os.Exit(cli.RunDoctor(args))
+	case "check":
+		os.Exit(cli.RunCheck(args))
+	case "fix":
+		os.Exit(cli.RunFix(args))
+	case "install":
+		os.Exit(cli.RunInstall(args))
 	case "ci":
-		os.Exit(runCI(args))
+		os.Exit(cli.RunCI(args))
 	case "verify-receipt":
-		os.Exit(runVerifyReceipt(args))
+		os.Exit(cli.RunVerifyReceipt(args))
 	case "metrics":
-		os.Exit(runMetrics(args))
+		os.Exit(cli.RunMetrics(args))
+	case "graph":
+		os.Exit(cli.RunGraph(args))
 	case "request-approval":
-		os.Exit(runRequestApproval(args))
+		os.Exit(cli.RunRequestApproval(args))
 	case "approve":
-		os.Exit(runApprovalDecision("approve", args))
+		os.Exit(cli.RunApprovalDecision("approve", args))
 	case "reject":
-		os.Exit(runApprovalDecision("reject", args))
+		os.Exit(cli.RunApprovalDecision("reject", args))
 	default:
 		fmt.Fprintf(os.Stderr, "blueprint: unknown command %q\n\n", cmd)
 		usage(os.Stderr)
-		os.Exit(4)
+		os.Exit(2)
 	}
 }
 
@@ -69,6 +72,7 @@ Commands:
   verify-receipt
                 Verify a tamper-evident CI receipt (receipt + audit chain)
   metrics       Show local validation metrics (no cloud telemetry)
+  graph         Print the change graph for the working tree
   request-approval
                 Request human approval for a high-risk change (two-person rule)
   approve       Approve a pending approval request: approve <id> [--reason ...]

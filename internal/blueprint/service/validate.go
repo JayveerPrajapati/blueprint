@@ -7,12 +7,14 @@ package service
 import (
 	"context"
 	"fmt"
+	"os"
 	"sort"
+	"strconv"
 	"time"
 
 	"github.com/JayveerPrajapati/blueprint/internal/blueprint/audit"
 	"github.com/JayveerPrajapati/blueprint/internal/blueprint/domain"
-	"github.com/JayveerPrajapati/blueprint/internal/blueprint/resilience"
+	"github.com/JayveerPrajapati/blueprint/internal/resilience"
 )
 
 // Check is the seam every validator implements. A check examines a ChangeRequest
@@ -30,6 +32,23 @@ type Check interface {
 	// its CheckResult is authoritative. A non-nil error means the check could
 	// not run (tool failure, missing dependency) and produces StatusError.
 	Run(ctx context.Context, req domain.ChangeRequest) (domain.CheckResult, error)
+}
+
+// CheckReporter observes the per-check lifecycle during Validate so
+// long-running pipelines (e.g. diff-gate's sandboxed tests:build-test check,
+// which can consume the whole gate budget) can emit incremental progress
+// instead of one final verdict rendered only at the end. It is OPTIONAL: a
+// nil reporter (the default) leaves every existing caller — check, ci, mcp —
+// byte-identical.
+//
+// Both callbacks run synchronously in the validation goroutine, immediately
+// before/after each check executes. They must not block the pipeline.
+type CheckReporter interface {
+	// CheckStarted is invoked before check i (0-based) of n begins.
+	CheckStarted(i, n int, name string)
+	// CheckFinished is invoked after check i of n completes, with the check's
+	// final status and its measured wall-clock duration.
+	CheckFinished(i, n int, name string, status domain.Status, duration time.Duration)
 }
 
 // optionalChecks is the catalog of opt-in checks a pipeline may legitimately
@@ -53,6 +72,7 @@ type BlueprintService struct {
 	metrics     MetricsRecorder
 	metricsPath string
 	audit       *audit.Writer
+	reporter    CheckReporter
 }
 
 // PolicyEvaluator maps a CheckResult to a final Status per the loaded policy
@@ -131,6 +151,14 @@ func WithAudit(w *audit.Writer) Option {
 	return func(s *BlueprintService) { s.audit = w }
 }
 
+// WithCheckReporter attaches a per-check lifecycle observer for incremental
+// progress output on long-running validations. Nil-safe: when absent (the
+// default), Validate emits no progress events and existing callers behave
+// exactly as before.
+func WithCheckReporter(r CheckReporter) Option {
+	return func(s *BlueprintService) { s.reporter = r }
+}
+
 // WithKernVersion sets the kern binary version the service stamps onto every
 // finding (P2-4, service-owned provenance). Callers obtain it from a
 // best-effort client.Version() probe. An empty value skips stamping, so a
@@ -167,7 +195,7 @@ func (s *BlueprintService) Validate(ctx context.Context, req domain.ChangeReques
 
 	// Empty change => documented NOOP contract (G1: "empty change => PASS/NOOP").
 	// The NOOP early return is intentionally audit-free: no-op validations
-	// write no audit record (P1-1).
+	// write no audit record.
 	if len(req.Files) == 0 {
 		return domain.ValidationResult{
 			Status:        domain.StatusPass,
@@ -178,12 +206,49 @@ func (s *BlueprintService) Validate(ctx context.Context, req domain.ChangeReques
 		}
 	}
 
-	results := make([]domain.CheckResult, 0, len(s.checks))
+	results := make([]domain.CheckResult, len(s.checks))
 	timeout := s.config.timeoutDuration()
 
-	for _, chk := range s.checks {
-		cr := s.runCheck(ctx, chk, req, timeout)
-		results = append(results, cr)
+	n := len(s.checks)
+	// Run the checks concurrently: each leg is independent (it scans its own
+	// subprocesses and writes its own per-repo caches — the architecture
+	// guard, secret scanner and duplication scanner share nothing mutable),
+	// so wall time is the slowest leg instead of the sum. The approval gate
+	// and the file-scan legs have no ordering dependency either: Validate
+	// never short-circuits on the gate (all checks run and Aggregate decides
+	// monotonically), so concurrent execution is semantically identical.
+	// All shared-state writes (reporter events, metrics, audit, aggregation)
+	// happen below in the single-threaded collection loop in check-list
+	// order, so the observable contract — event interleaving, result order,
+	// audit chain order — is unchanged.
+	done := make([]chan struct{}, n)
+	for i, chk := range s.checks {
+		done[i] = make(chan struct{})
+		go func(i int, chk Check) {
+			defer func() {
+				if r := recover(); r != nil {
+					// A panicking check must never hang the pipeline (a
+					// recovered panic would deadlock on <-done below); turn it
+					// into a visible ERROR result instead of a silent stall.
+					results[i] = domain.CheckResult{
+						Name:   chk.Name(),
+						Status: domain.StatusError,
+						Error:  fmt.Sprintf("check %s panicked: %v", chk.Name(), r),
+					}
+				}
+				close(done[i])
+			}()
+			results[i] = s.runCheck(ctx, chk, req, timeout)
+		}(i, chk)
+	}
+	for i, chk := range s.checks {
+		if s.reporter != nil {
+			s.reporter.CheckStarted(i, n, chk.Name())
+		}
+		<-done[i]
+		if s.reporter != nil {
+			s.reporter.CheckFinished(i, n, results[i].Name, results[i].Status, time.Duration(results[i].Duration)*time.Millisecond)
+		}
 	}
 	// P2-2: record which opt-in checks were NOT exercised in this pipeline
 	// (e.g. resilience without --resilience) so the skip is visible audit
@@ -288,7 +353,7 @@ func (s *BlueprintService) recordMetrics(status domain.Status, results []domain.
 }
 
 // writeAudit appends one self-hashed audit record for a completed validation
-// (P1-1). Best-effort: a failed audit write must never fail a validation —
+// Best-effort: a failed audit write must never fail a validation —
 // same philosophy as metrics. Records carry findings META only
 // (rule_id/severity/category/file/line); messages, evidence, and snippets are
 // never written (redaction invariant).
@@ -389,7 +454,10 @@ func (s *BlueprintService) runCheck(ctx context.Context, chk Check, req domain.C
 		cr.Status = enforcedStatus
 		cr.Findings = enforcedFindings
 	}
-
+	// perf SLI gate: advisory WARN on budget overshoot (never BLOCK —
+	// timing is flaky; order-of-magnitude regression detector). Runs after
+	// policy so the finding survives a policy-rewritten result.
+	applyPerfSLI(&cr)
 	return cr
 }
 
@@ -407,6 +475,12 @@ func (s *BlueprintService) Aggregate(results []domain.CheckResult) (status domai
 	skipped := 0
 
 	findings = []domain.Finding{}
+	// F-DG4: a check that BLOCKs (verdict) with zero SeverityBlock findings
+	// must still surface in summary.Blocks — otherwise the summary line says
+	// blocks=0 while the check renders [BLOCK]. Counted per check, only when
+	// the check's own findings carry no severity-block, so a block finding is
+	// never double-counted.
+	noFindingBlockVerdicts := 0
 	for _, cr := range results {
 		// A check is skipped when it says so explicitly (Skipped flag) or
 		// when its status IS StatusSkip — both must be counted and must not
@@ -420,6 +494,15 @@ func (s *BlueprintService) Aggregate(results []domain.CheckResult) (status domai
 			hasError = true
 		case domain.StatusBlock:
 			hasBlock = true
+			blockFindings := 0
+			for _, f := range cr.Findings {
+				if f.Severity == domain.SeverityBlock {
+					blockFindings++
+				}
+			}
+			if blockFindings == 0 {
+				noFindingBlockVerdicts++
+			}
 		case domain.StatusWarn:
 			hasWarn = true
 		case domain.StatusPass:
@@ -465,6 +548,9 @@ func (s *BlueprintService) Aggregate(results []domain.CheckResult) (status domai
 			summary.Blocks++
 		}
 	}
+	// F-DG4: fold in BLOCK verdicts that produced no severity-block
+	// findings, so blocks >= 1 whenever any check renders [BLOCK].
+	summary.Blocks += noFindingBlockVerdicts
 
 	return status, exitCode, findings, summary
 }
@@ -474,8 +560,18 @@ func (s *BlueprintService) sinceMs(start time.Time) int64 {
 }
 
 func (c Config) timeoutDuration() time.Duration {
+	for _, key := range []string{"BLUEPRINT_TIMEOUT", "BLUEPRINT_CI_TIMEOUT"} {
+		if val := os.Getenv(key); val != "" {
+			if d, err := time.ParseDuration(val); err == nil && d > 0 {
+				return d
+			}
+			if secs, err := strconv.Atoi(val); err == nil && secs > 0 {
+				return time.Duration(secs) * time.Second
+			}
+		}
+	}
 	if c.TimeoutSec <= 0 {
-		return 0
+		return 300 * time.Second
 	}
 	return time.Duration(c.TimeoutSec) * time.Second
 }

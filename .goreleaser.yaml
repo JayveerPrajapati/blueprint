@@ -22,7 +22,7 @@ builds:
       - amd64
       - arm64
     ldflags:
-      - -s -w -X github.com/JayveerPrajapati/blueprint/internal/blueprint/version.Version={{.Version}}
+      - -s -w -X github.com/JayveerPrajapati/blueprint/internal/bpreceipt/version.Version={{.Version}}
 
   - id: blueprint-mcp
     main: ./cmd/blueprint-mcp
@@ -37,7 +37,7 @@ builds:
       - amd64
       - arm64
     ldflags:
-      - -s -w -X github.com/JayveerPrajapati/blueprint/internal/blueprint/version.Version={{.Version}}
+      - -s -w -X github.com/JayveerPrajapati/blueprint/internal/bpreceipt/version.Version={{.Version}}
 
 archives:
   - formats: [tar.gz]

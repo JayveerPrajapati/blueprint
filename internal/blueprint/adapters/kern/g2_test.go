@@ -11,12 +11,21 @@ import (
 	"github.com/JayveerPrajapati/blueprint/internal/blueprint/domain"
 )
 
+// kernRequired reports whether the environment demands a resolvable kern
+// binary. CI sets KERN_REQUIRE_BINARY=1 so binary-availability skips FAIL
+// instead of silently passing the gate (the mechanism that let the
+// VersionAtLeast bug ship unnoticed). Locally the skip stays friendly.
+func kernRequired() bool { return os.Getenv("KERN_REQUIRE_BINARY") == "1" }
+
 // requireKernBinary skips the test if the kern binary isn't available. G2
 // tests exercise the real kern binary against fixture repos.
 func requireKernBinary(t *testing.T) *KernClient {
 	t.Helper()
 	client, err := NewKernClient()
 	if err != nil {
+		if kernRequired() {
+			t.Fatalf("KERN_REQUIRE_BINARY=1 but kern binary not available: %v", err)
+		}
 		t.Skipf("kern binary not available, skipping integration test: %v", err)
 	}
 	return client
@@ -30,14 +39,23 @@ func requireKernBinary(t *testing.T) *KernClient {
 func requireFingerprintBinary(t *testing.T) {
 	t.Helper()
 	if _, err := NewKernClient(); err != nil {
+		if kernRequired() {
+			t.Fatalf("KERN_REQUIRE_BINARY=1 but kern binary not available: %v", err)
+		}
 		t.Skipf("kern binary not available, skipping integration test: %v", err)
 	}
 	bin, err := resolveKernBinary()
 	if err != nil {
+		if kernRequired() {
+			t.Fatalf("KERN_REQUIRE_BINARY=1 but kern binary not resolvable: %v", err)
+		}
 		t.Skipf("kern binary not available: %v", err)
 	}
 	out, err := exec.Command(bin, "--help").CombinedOutput()
 	if err != nil {
+		if kernRequired() {
+			t.Fatalf("KERN_REQUIRE_BINARY=1 but `kern --help` failed: %v", err)
+		}
 		t.Skipf("kern --help failed (%v); skipping fingerprint-backed assertions", err)
 	}
 	if !strings.Contains(string(out), "fingerprint") {
@@ -234,7 +252,7 @@ func TestG2_DeletedImportScenario(t *testing.T) {
 	}
 }
 
-// TestG2_CLI_EndToEnd verifies the full CLI path: `blueprint check --json`
+// TestG2_CLI_EndToEnd verifies the full CLI path: `kern check --json`
 // against the IllegalDependency fixture produces a BLOCK result with correct
 // JSON structure.
 func TestG2_CLI_EndToEnd(t *testing.T) {
@@ -243,10 +261,10 @@ func TestG2_CLI_EndToEnd(t *testing.T) {
 	requireFingerprintBinary(t)
 	fr := IllegalDependency(t)
 
-	// Build the blueprint binary once (cached).
+	// Build the merged kern binary once (cached).
 	binPath := buildBlueprintBinary(t)
 
-	// Run `blueprint check --json --repo <fixture> --source ci`.
+	// Run `kern check --json --repo <fixture> --source ci`.
 	// KERN_BINARY is inherited from the test environment.
 	out, code := runBlueprintCheck(t, binPath, fr.RepoPath, "--json")
 

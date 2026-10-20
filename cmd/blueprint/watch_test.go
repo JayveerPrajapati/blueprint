@@ -7,9 +7,9 @@ import (
 
 	"github.com/JayveerPrajapati/blueprint/internal/blueprint/adapters/kern"
 	"github.com/JayveerPrajapati/blueprint/internal/blueprint/domain"
-	"github.com/JayveerPrajapati/blueprint/internal/blueprint/policy"
 	"github.com/JayveerPrajapati/blueprint/internal/blueprint/service"
 	"github.com/JayveerPrajapati/blueprint/internal/blueprint/watcher"
+	"github.com/JayveerPrajapati/blueprint/internal/bppolicy/policy"
 )
 
 // recordingCheck is a service.Check test double that records the ChangeRequest

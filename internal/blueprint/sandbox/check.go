@@ -87,7 +87,7 @@ func (c Check) Run(ctx context.Context, req domain.ChangeRequest) (result domain
 			RuleID:       "sandbox:network-isolation-unavailable",
 			Severity:     sev,
 			Category:     domain.CategoryTests,
-			Message:      "network isolation requested but unavailable on this platform; sandbox ran without egress containment",
+			Message:      "network isolation requested but unavailable on this platform; network isolation unavailable (degraded); sandbox ran without egress containment",
 			Explanation:  "Network isolation requires Linux CLONE_NEWNET or macOS sandbox-exec. On this platform the sandboxed build/test can reach the network, so a failing or malicious test could make external calls. The sandbox result is still valid for build/test correctness, but egress was not contained.",
 			SuggestedFix: "Run CI on a Linux runner for full network isolation, or set BLUEPRINT_REQUIRE_NETISO=1 to hard-fail when isolation is unavailable.",
 			Scope:        "repo",
@@ -108,110 +108,284 @@ func (c Check) Run(ctx context.Context, req domain.ChangeRequest) (result domain
 		}
 	}()
 
-	// Step 1: build.
 	sandboxRan = true
-	buildResult := Run(ctx, req.RepositoryRoot, []string{"go", "build", "./..."}, c.config)
-	if buildResult.Error != "" {
+	worktreePath, cleanup, err := createWorktree(req.RepositoryRoot)
+	if err != nil {
 		return domain.CheckResult{
 			Name:   c.Name(),
 			Status: domain.StatusError,
-			Error:  "sandbox build failed: " + buildResult.Error,
+			Error:  fmt.Sprintf("create worktree: %v", err),
 		}, nil
 	}
-	if buildResult.TimedOut {
+	defer cleanup()
+	// The check validates the CHANGE, not just the committed tree:
+	// createWorktree checks out HEAD only, so without applying the staged
+	// diff a staged change that breaks tests would pass whenever HEAD is
+	// green, and a HEAD-only regression would block an innocent staged
+	// change under a misleading "staged changes cause test failures"
+	// message. Applying the staged diff (HEAD -> index) makes the worktree
+	// match the tree the commit would produce; nothing staged is a no-op
+	// (plain HEAD validation, the old behavior). Fail-closed: an apply
+	// error is an ERROR, never a partial application.
+	if serr := applyStagedDiff(req.RepositoryRoot, worktreePath); serr != nil {
 		return domain.CheckResult{
 			Name:   c.Name(),
 			Status: domain.StatusError,
-			Error:  fmt.Sprintf("sandbox build timed out after %s", c.config.Timeout),
-		}, nil
-	}
-	if !buildResult.Ok {
-		return domain.CheckResult{
-			Name:   c.Name(),
-			Status: domain.StatusBlock,
-			Findings: []domain.Finding{{
-				RuleID:       "sandbox:build-failure",
-				Severity:     domain.SeverityBlock,
-				Category:     domain.CategoryTests,
-				File:         "",
-				Line:         0,
-				Message:      "Build failed in isolated sandbox",
-				Explanation:  fmt.Sprintf("The staged changes cause a build failure (exit code %d). The repository must compile before changes can be committed.", buildResult.ExitCode),
-				SuggestedFix: "Fix the compilation errors shown in the evidence, then re-run blueprint check.",
-				Evidence: []domain.Evidence{{
-					Kind:        "build-output",
-					Description: "truncated build stderr",
-					Location:    "sandbox:go build ./...",
-				}},
-			}},
+			Error:  fmt.Sprintf("apply staged changes: %v", serr),
 		}, nil
 	}
 
-	// Step 2: test (only if build passed).
-	testResult := Run(ctx, req.RepositoryRoot, []string{"go", "test", "./..."}, c.config)
-	if testResult.Error != "" {
-		return domain.CheckResult{
-			Name:   c.Name(),
-			Status: domain.StatusError,
-			Error:  "sandbox test failed: " + testResult.Error,
-		}, nil
-	}
-	if testResult.TimedOut {
-		return domain.CheckResult{
-			Name:   c.Name(),
-			Status: domain.StatusError,
-			Error:  fmt.Sprintf("sandbox test timed out after %s", c.config.Timeout),
-		}, nil
-	}
-	if !testResult.Ok {
-		finding := domain.Finding{
-			RuleID:       "sandbox:test-failure",
-			Severity:     domain.SeverityBlock,
-			Category:     domain.CategoryTests,
-			Message:      "Tests failed in isolated sandbox",
-			Explanation:  fmt.Sprintf("The staged changes cause test failures (exit code %d). All tests must pass before changes can be committed.", testResult.ExitCode),
-			SuggestedFix: "Fix the failing tests shown in the evidence, then re-run blueprint check.",
-			Evidence: []domain.Evidence{{
-				Kind:        "test-output",
-				Description: "truncated test output",
-				Location:    "sandbox:go test ./...",
-			}},
+	targets := c.config.Matrix
+	if len(targets) == 0 {
+		buildCmd := []string{"go", "build", "./..."}
+		if env := os.Getenv("BLUEPRINT_SANDBOX_BUILD"); env != "" {
+			buildCmd = SplitCommand(env)
 		}
-		// Attach truncated stderr as evidence (non-secret — it's build/test output).
-		if testResult.Stderr != "" {
-			finding.Evidence[0].Description = truncateForEvidence(testResult.Stderr, 500)
-		} else if testResult.Stdout != "" {
-			finding.Evidence[0].Description = truncateForEvidence(testResult.Stdout, 500)
+		testCmd := []string{"go", "test", "-short", "./..."}
+		if env := os.Getenv("BLUEPRINT_SANDBOX_TEST"); env != "" {
+			testCmd = SplitCommand(env)
 		}
-		return domain.CheckResult{
-			Name:     c.Name(),
-			Status:   domain.StatusBlock,
-			Findings: []domain.Finding{finding},
-		}, nil
+		targets = []MatrixTarget{{
+			Name:  "go",
+			Dir:   ".",
+			Build: buildCmd,
+			Test:  testCmd,
+		}}
 	}
 
-	// Both build and test passed.
+	// effectiveBudget is the real wall-clock budget the sandbox commands run
+	// under: the earlier of the caller's ctx deadline (e.g. a diff-gate gate
+	// budget) and the configured sandbox timeout. Timeout messages must
+	// report this, not the configured timeout alone — a check killed by a
+	// 60s gate budget is NOT "timed out after 5m0s".
+	budget := effectiveBudget(ctx, c.config.Timeout)
+
+	for _, target := range targets {
+		// Run build command if configured
+		if len(target.Build) > 0 {
+			buildResult := RunInWorktree(ctx, worktreePath, target.Dir, target.Build, c.config)
+			if buildResult.Error != "" {
+				return domain.CheckResult{
+					Name:   c.Name(),
+					Status: domain.StatusError,
+					Error:  fmt.Sprintf("sandbox build [%s] failed: %s", target.Name, buildResult.Error),
+				}, nil
+			}
+			if buildResult.TimedOut {
+				return domain.CheckResult{
+					Name:   c.Name(),
+					Status: domain.StatusError,
+					Error:  fmt.Sprintf("sandbox build [%s] timed out after %s", target.Name, budget),
+				}, nil
+			}
+			if !buildResult.Ok {
+				evidenceLoc := fmt.Sprintf("sandbox:%s", strings.Join(target.Build, " "))
+				if target.Dir != "" && target.Dir != "." {
+					evidenceLoc = fmt.Sprintf("sandbox:%s (%s)", strings.Join(target.Build, " "), target.Dir)
+				}
+				finding := domain.Finding{
+					RuleID:       "sandbox:build-failure",
+					Severity:     domain.SeverityBlock,
+					Category:     domain.CategoryTests,
+					File:         target.Dir,
+					Line:         0,
+					Message:      fmt.Sprintf("Build failed for %s in isolated sandbox", target.Name),
+					Explanation:  fmt.Sprintf("The staged changes cause a build failure in %s (exit code %d). The target must compile before changes can be committed.", target.Name, buildResult.ExitCode),
+					SuggestedFix: "Fix the compilation errors shown in the evidence, then re-run blueprint check.",
+					Evidence: []domain.Evidence{{
+						Kind:        "build-output",
+						Description: "truncated build stderr",
+						Location:    evidenceLoc,
+					}},
+				}
+				if buildResult.Stderr != "" {
+					finding.Evidence[0].Description = failureDigest(buildResult.Stderr, 2000)
+				} else if buildResult.Stdout != "" {
+					finding.Evidence[0].Description = failureDigest(buildResult.Stdout, 2000)
+				}
+				return domain.CheckResult{
+					Name:     c.Name(),
+					Status:   domain.StatusBlock,
+					Findings: []domain.Finding{finding},
+				}, nil
+			}
+		}
+
+		// Run test command if configured
+		if len(target.Test) > 0 {
+			testResult := RunInWorktree(ctx, worktreePath, target.Dir, target.Test, c.config)
+			if testResult.Error != "" {
+				return domain.CheckResult{
+					Name:   c.Name(),
+					Status: domain.StatusError,
+					Error:  fmt.Sprintf("sandbox test [%s] failed: %s", target.Name, testResult.Error),
+				}, nil
+			}
+			if testResult.TimedOut {
+				return domain.CheckResult{
+					Name:   c.Name(),
+					Status: domain.StatusError,
+					Error:  fmt.Sprintf("sandbox test [%s] timed out after %s", target.Name, budget),
+				}, nil
+			}
+			if !testResult.Ok {
+				evidenceLoc := fmt.Sprintf("sandbox:%s", strings.Join(target.Test, " "))
+				if target.Dir != "" && target.Dir != "." {
+					evidenceLoc = fmt.Sprintf("sandbox:%s (%s)", strings.Join(target.Test, " "), target.Dir)
+				}
+				finding := domain.Finding{
+					RuleID:       "sandbox:test-failure",
+					Severity:     domain.SeverityBlock,
+					Category:     domain.CategoryTests,
+					File:         target.Dir,
+					Line:         0,
+					Message:      fmt.Sprintf("Tests failed for %s in isolated sandbox", target.Name),
+					Explanation:  fmt.Sprintf("The staged changes cause test failures in %s (exit code %d). All tests must pass before changes can be committed.", target.Name, testResult.ExitCode),
+					SuggestedFix: "Fix the failing tests shown in the evidence, then re-run blueprint check.",
+					Evidence: []domain.Evidence{{
+						Kind:        "test-output",
+						Description: "truncated test output",
+						Location:    evidenceLoc,
+					}},
+				}
+				if testResult.Stderr != "" {
+					finding.Evidence[0].Description = failureDigest(testResult.Stderr, 2000)
+				} else if testResult.Stdout != "" {
+					finding.Evidence[0].Description = failureDigest(testResult.Stdout, 2000)
+				}
+				return domain.CheckResult{
+					Name:     c.Name(),
+					Status:   domain.StatusBlock,
+					Findings: []domain.Finding{finding},
+				}, nil
+			}
+		}
+
+		// Run combined command if configured
+		if len(target.Command) > 0 {
+			cmdResult := RunInWorktree(ctx, worktreePath, target.Dir, target.Command, c.config)
+			if cmdResult.Error != "" {
+				return domain.CheckResult{
+					Name:   c.Name(),
+					Status: domain.StatusError,
+					Error:  fmt.Sprintf("sandbox command [%s] failed: %s", target.Name, cmdResult.Error),
+				}, nil
+			}
+			if cmdResult.TimedOut {
+				return domain.CheckResult{
+					Name:   c.Name(),
+					Status: domain.StatusError,
+					Error:  fmt.Sprintf("sandbox command [%s] timed out after %s", target.Name, budget),
+				}, nil
+			}
+			if !cmdResult.Ok {
+				evidenceLoc := fmt.Sprintf("sandbox:%s", strings.Join(target.Command, " "))
+				if target.Dir != "" && target.Dir != "." {
+					evidenceLoc = fmt.Sprintf("sandbox:%s (%s)", strings.Join(target.Command, " "), target.Dir)
+				}
+				finding := domain.Finding{
+					RuleID:       "sandbox:test-failure",
+					Severity:     domain.SeverityBlock,
+					Category:     domain.CategoryTests,
+					File:         target.Dir,
+					Line:         0,
+					Message:      fmt.Sprintf("Command failed for %s in isolated sandbox", target.Name),
+					Explanation:  fmt.Sprintf("The staged changes cause command failure in %s (exit code %d).", target.Name, cmdResult.ExitCode),
+					SuggestedFix: "Fix the failures shown in the evidence, then re-run blueprint check.",
+					Evidence: []domain.Evidence{{
+						Kind:        "command-output",
+						Description: "truncated output",
+						Location:    evidenceLoc,
+					}},
+				}
+				if cmdResult.Stderr != "" {
+					finding.Evidence[0].Description = failureDigest(cmdResult.Stderr, 2000)
+				} else if cmdResult.Stdout != "" {
+					finding.Evidence[0].Description = failureDigest(cmdResult.Stdout, 2000)
+				}
+				return domain.CheckResult{
+					Name:     c.Name(),
+					Status:   domain.StatusBlock,
+					Findings: []domain.Finding{finding},
+				}, nil
+			}
+		}
+	}
+
 	return domain.CheckResult{
 		Name:   c.Name(),
 		Status: domain.StatusPass,
 	}, nil
 }
 
-// truncateForEvidence truncates a string to maxChars for inclusion in finding
-// evidence, appending a truncation marker if needed.
+// effectiveBudget returns the actual wall-clock budget the sandbox commands
+// run under: the earlier of the caller's ctx deadline and the configured
+// timeout. A gate that gives the check 60s while the sandbox config allows
+// 5m must report 60s as the timeout, not 5m.
+func effectiveBudget(ctx context.Context, configured time.Duration) time.Duration {
+	if d, ok := ctx.Deadline(); ok {
+		if rem := time.Until(d); rem > 0 && rem < configured {
+			return rem.Round(time.Second)
+		}
+	}
+	return configured
+}
+
+// SplitCommand splits a command line string by whitespace into an argument slice.
+func SplitCommand(cmd string) []string {
+	return strings.Fields(cmd)
+}
+
+// truncateForEvidence keeps the HEAD and TAIL of s (roughly maxChars total)
+// for inclusion in finding evidence. Build/test tools stream failure output
+// at unpredictable positions: go test emits a failing package's detail at
+// the moment that package completes (fast packages land near the head, slow
+// ones near the tail) and the final FAIL verdict last; go build emits the
+// compile error mid-output then the final FAIL. Head-only hid the verdict
+// and late failures; tail-only hid early ones (both observed live while
+// diagnosing a BLOCK whose 500-char head-truncated evidence contained only
+// "flowchart LR..." chatter from a passing test).
 func truncateForEvidence(s string, maxChars int) string {
 	s = strings.TrimSpace(s)
 	if len(s) <= maxChars {
 		return s
 	}
-	return s[:maxChars] + "\n... (truncated)"
+	head := maxChars / 4
+	tail := maxChars * 3 / 4
+	elided := len(s) - head - tail
+	if elided < 0 {
+		elided = 0
+	}
+	return s[:head] + fmt.Sprintf("\n... (%d bytes elided) ...\n", elided) + s[len(s)-tail:]
 }
 
-// timeoutContext returns a context with the sandbox timeout, or the parent
-// context if no timeout is set.
-func timeoutContext(ctx context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
-	if timeout == 0 {
-		return ctx, func() {}
+// failureDigest builds finding evidence from the failure-significant lines
+// of build/test output: go test's "--- FAIL: Test" markers, its "FAIL" and
+// "FAIL\t<package>" summary lines, "panic:" lines, and go's diagnostic
+// "<file>.go:<line>: message" lines (which also carry t.Error/t.Fatal
+// detail, prefixed with the _test.go location). Output position is
+// unpredictable in multi-package runs (packages stream as they complete),
+// so plain truncation cannot reliably capture them; when no
+// failure-significant line is found, it falls back to truncateForEvidence.
+func failureDigest(s string, maxChars int) string {
+	var picked []string
+	for _, ln := range strings.Split(s, "\n") {
+		ln = strings.TrimRight(ln, "\r")
+		if ln == "" || strings.HasPrefix(ln, "ok  ") {
+			continue
+		}
+		if strings.HasPrefix(ln, "--- FAIL") || strings.HasPrefix(ln, "FAIL") ||
+			strings.HasPrefix(ln, "panic:") ||
+			(strings.Contains(ln, ".go:") && strings.Contains(ln, ": ")) {
+			picked = append(picked, ln)
+		}
 	}
-	return context.WithTimeout(ctx, timeout)
+	if len(picked) == 0 {
+		return truncateForEvidence(s, maxChars)
+	}
+	digest := strings.Join(picked, "\n")
+	if len(digest) > maxChars {
+		return digest[:maxChars] + fmt.Sprintf("\n... (%d more failure lines elided)", len(picked))
+	}
+	return digest
 }

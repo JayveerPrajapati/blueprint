@@ -1,4 +1,4 @@
-// Package audit implements the Blueprint validation audit trail (P1-1).
+// Package audit implements the Blueprint validation audit trail.
 //
 // Every validation that flows through the canonical pipeline
 // (BlueprintService.Validate) writes one JSONL record to
@@ -27,8 +27,10 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -41,7 +43,7 @@ import (
 // FindingMeta is the redacted metadata of one finding: rule, severity,
 // category, and location. It deliberately omits message, explanation,
 // suggested_fix, evidence, and snippets (redaction invariant). Suppression
-// state (P1-2) is included so a suppression lift is itself auditable.
+// state is included so a suppression lift is itself auditable.
 type FindingMeta struct {
 	RuleID   string          `json:"rule_id"`
 	Severity domain.Severity `json:"severity"`
@@ -198,14 +200,14 @@ func (w *Writer) Write(r Record) error {
 		return err
 	}
 	if _, err := f.Write(append(final, '\n')); err != nil {
-		f.Close()
+		_ = f.Close()
 		return err
 	}
 	// fsync before releasing the flock (H7): the line must be durable on disk
 	// before another process (or a crash) observes the chain tail, otherwise a
 	// crash mid-append could leave a partial line that breaks VerifyChain.
 	if err := f.Sync(); err != nil {
-		f.Close()
+		_ = f.Close()
 		return err
 	}
 	if err := f.Close(); err != nil {
@@ -249,7 +251,7 @@ func (w *Writer) readTailHash() string {
 	if err != nil {
 		return ""
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	fi, err := f.Stat()
 	if err != nil {
 		return ""
@@ -290,7 +292,7 @@ func (w *Writer) readFullLastHash() string {
 	if err != nil {
 		return ""
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
 	last := ""
@@ -351,7 +353,7 @@ func (w *Writer) VerifyChain() (string, error) {
 
 	data, err := os.ReadFile(w.path)
 	if err != nil {
-		if os.IsNotExist(err) {
+		if errors.Is(err, fs.ErrNotExist) {
 			return "", nil // no chain yet — trivially intact
 		}
 		return "", err
@@ -365,7 +367,7 @@ func (w *Writer) VerifyChain() (string, error) {
 		}
 		var rec Record
 		if err := json.Unmarshal([]byte(line), &rec); err != nil {
-			return "", fmt.Errorf("record %d: cannot parse: %v", i+1, err)
+			return "", fmt.Errorf("record %d: cannot parse: %w", i+1, err)
 		}
 		if rec.PreviousHash == "" {
 			// Anchor (genesis or legacy prefix). Only legal before the chain
@@ -384,7 +386,7 @@ func (w *Writer) VerifyChain() (string, error) {
 		unsigned.Hash = ""
 		b, err := json.Marshal(unsigned)
 		if err != nil {
-			return "", fmt.Errorf("record %d (correlation_id %q): cannot re-marshal for hash check: %v", i+1, rec.CorrelationID, err)
+			return "", fmt.Errorf("record %d (correlation_id %q): cannot re-marshal for hash check: %w", i+1, rec.CorrelationID, err)
 		}
 		sum := sha256.Sum256(b)
 		if want := hex.EncodeToString(sum[:]); rec.Hash != want {
@@ -415,7 +417,7 @@ func (w *Writer) ChainContainsHash(hash string) (bool, error) {
 	}
 	data, err := os.ReadFile(w.path)
 	if err != nil {
-		if os.IsNotExist(err) {
+		if errors.Is(err, fs.ErrNotExist) {
 			return false, nil
 		}
 		return false, err
@@ -427,7 +429,7 @@ func (w *Writer) ChainContainsHash(hash string) (bool, error) {
 		}
 		var rec Record
 		if err := json.Unmarshal([]byte(line), &rec); err != nil {
-			return false, fmt.Errorf("record %d: cannot parse: %v", i+1, err)
+			return false, fmt.Errorf("record %d: cannot parse: %w", i+1, err)
 		}
 		if rec.Hash == hash {
 			return true, nil
