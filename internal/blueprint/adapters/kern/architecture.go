@@ -10,11 +10,10 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
-	"strconv"
 	"strings"
-	"time"
 
 	"github.com/JayveerPrajapati/blueprint/internal/blueprint/domain"
+	"github.com/JayveerPrajapati/blueprint/internal/guard"
 )
 
 // ArchitectureCheck enforces the architecture boundaries declared in
@@ -86,7 +85,7 @@ func (c *ArchitectureCheck) Run(ctx context.Context, req domain.ChangeRequest) (
 		return domain.CheckResult{Name: c.Name(), Status: domain.StatusSkip, Skipped: true}, nil
 	}
 
-	// Rebuild the kern index only when it is stale (P0.2 content-addressed
+	// Rebuild the kern index only when it is stale (content-addressed
 	// staleness verdict; P2-4 index freshness provenance; see
 	// ensureFreshIndex). A stale index is rebuilt once and re-verified; a
 	// rebuild that does not converge is an ERROR, never a silent pass.
@@ -95,7 +94,7 @@ func (c *ArchitectureCheck) Run(ctx context.Context, req domain.ChangeRequest) (
 		return result, nil
 	}
 
-	// P0.4 authz gate: ask kern for the change's authorization verdict BEFORE
+	// authz gate: ask kern for the change's authorization verdict BEFORE
 	// the boundary check (degradation contract and denial handling in
 	// authzVerdict). A denied verdict blocks and skips boundary evaluation.
 	authzFindings, result, done := c.authzVerdict(ctx, req)
@@ -158,10 +157,15 @@ func (c *ArchitectureCheck) degradedWarnFinding(req domain.ChangeRequest) (domai
 	// kern's LoadBoundaries, which yields an empty rule set for a missing
 	// file). But architecture that is not evaluated must be visible, so a
 	// non-empty change surfaces a WARN finding instead of a bare SKIP.
+	// kern's index directory is gitignored, so a validation run in a
+	// detached-worktree sandbox (e.g. CI at a non-HEAD ref) will not contain
+	// it even when the source repo has a fresh index — distinguish that case
+	// from "boundaries were never declared".
 	if _, err := os.Stat(filepath.Join(req.RepositoryRoot, ".kern")); err != nil {
 		if len(stagedFilePaths(req)) == 0 {
 			return domain.CheckResult{Name: c.Name(), Status: domain.StatusSkip, Skipped: true}, true
 		}
+		msg, expl, fix := archNoKernDetail(req.RepositoryRoot)
 		return domain.CheckResult{
 			Name:   c.Name(),
 			Status: domain.StatusWarn,
@@ -169,9 +173,9 @@ func (c *ArchitectureCheck) degradedWarnFinding(req domain.ChangeRequest) (domai
 				RuleID:       "architecture:not-enforced",
 				Severity:     domain.SeverityWarn,
 				Category:     domain.CategoryArchitecture,
-				Message:      "no .kern/ index present in this repository; architecture boundaries are not evaluated, so this change is not checked against any boundary rules",
-				Explanation:  "A missing .kern/ directory means no architecture boundaries have been declared (kern has never been run in this repo). Without the index, the guard check cannot detect boundary violations, so a change that would otherwise be blocked could pass silently.",
-				SuggestedFix: "Declare boundaries with `kern init` (or commit a .kern/boundaries.json) so this change is evaluated against real boundary rules, then re-run the check.",
+				Message:      msg,
+				Explanation:  expl,
+				SuggestedFix: fix,
 				RuleVersion:  "1",
 				Confidence:   1.0,
 				Scope:        "repo",
@@ -181,88 +185,114 @@ func (c *ArchitectureCheck) degradedWarnFinding(req domain.ChangeRequest) (domai
 	return domain.CheckResult{}, false
 }
 
+// archNoKernDetail builds the architecture:not-enforced message for a repo
+// (or validation sandbox) with no .kern/ at the evaluated path. When the git
+// worktree list shows the source repo keeps a .kern/ index elsewhere (kern's
+// index is gitignored, so a detached-worktree CI sandbox cannot see it), the
+// WARN is phrased as "sandbox cannot see the index" rather than "kern has
+// never been run here".
+func archNoKernDetail(evalRoot string) (msg, explanation, fix string) {
+	noIndexAtAll := true
+	if out, err := exec.Command("git", "-C", evalRoot, "worktree", "list", "--porcelain").Output(); err == nil {
+		for _, line := range strings.Split(string(out), "\n") {
+			if !strings.HasPrefix(line, "worktree ") {
+				continue
+			}
+			p := strings.TrimSpace(strings.TrimPrefix(line, "worktree "))
+			if _, err := os.Stat(filepath.Join(p, ".kern")); err == nil {
+				noIndexAtAll = false
+				break
+			}
+		}
+	}
+	if noIndexAtAll {
+		return "no .kern/ index present in this repository; architecture boundaries are not evaluated, so this change is not checked against any boundary rules",
+			"No .kern/ means no architecture boundaries have been declared for this repository. Without the index, the guard check cannot detect boundary violations, so a change that would otherwise be blocked could pass silently.",
+			"Declare boundaries with `kern guard init` (writes .kern/boundaries.json) or commit a .kern/boundaries.json, then re-run the check."
+	}
+	return "the repository has a .kern/ index, but this validation sandbox cannot see it; architecture boundaries were not enforced for this change",
+		"The .kern/ index exists in the repository's git worktree(s), but this validation ran in an isolated sandbox (e.g. a detached-worktree CI run) where the gitignored index is absent. The change was therefore NOT checked against the declared boundary rules — it is not proof that boundaries are clean.",
+		"Commit boundaries into the repo so sandboxes can enforce them (kern guard init writes .kern/boundaries.json; make sure it is tracked, while .kern/the-index itself stays gitignored), or run the check against the indexed working tree."
+}
+
 // ensureFreshIndex rebuilds the kern index only when it is stale and returns
 // the index freshness verdict ("fresh"/"rebuilt") for provenance stamping on
-// every finding. P0.2: staleness is kern's authoritative content-addressed
-// verdict (`kern index status --json`), not an mtime heuristic — operations
-// that preserve mtimes (e.g. `git apply`) can no longer hide a stale index.
-// --strict forces kern to recompute content_root over every file, so
-// untracked proposed-new files are counted too. A stale index is rebuilt once
-// and re-verified; a rebuild that does NOT converge is an ERROR (done=true),
-// never a silent pass on a potentially-misleading index.
+// every finding. Staleness is kern's authoritative content-addressed
+// verdict, not an mtime heuristic — operations that preserve mtimes (e.g.
+// `git apply`) can no longer hide a stale index (git hashes content, so a
+// content edit flips the tree OID even when the mtime is untouched).
+// A stale index is rebuilt once and re-verified; a rebuild that does NOT
+// converge is an ERROR (done=true), never a silent pass on a
+// potentially-misleading index.
+//
+// Phase 2 consolidation: the default path is ONE subprocess —
+// `kern index ensure-fresh --json` (EnsureFreshIndex) — which performs the
+// whole probe → update → re-verify sequence internally: a cheap NON-strict
+// git tree-OID stale check (no content walk), an incremental update (or full
+// build when no index loads) when stale, a strict post-save re-verify from
+// disk as the trust anchor, a loose re-verify when strict cannot converge
+// (strict counts unparseable files a build skips), and a fail-closed "stale"
+// result on non-convergence. This replaces the former 3-4 subprocess sequence
+// (status --strict → update → status --strict → status) that cost ~2.6s per
+// pre-commit `kern check` invocation. The pre-update probe's strictness was
+// deliberately redundant — the post-update strict re-verify is the real
+// observation.
+//
+// The BLUEPRINT_ALLOW_STALE_REBUILD=1 env branch is unchanged: an explicit
+// opt-in that rebuilds once and trusts the result without re-verifying
+// convergence.
 func (c *ArchitectureCheck) ensureFreshIndex(ctx context.Context, req domain.ChangeRequest) (freshness string, result domain.CheckResult, done bool) {
-	idxStatus, err := c.client.IndexStatus(ctx, req.RepositoryRoot, true)
-	if err != nil {
-		return "", domain.CheckResult{Name: c.Name(), Status: domain.StatusError, Error: "kern index status unavailable: " + err.Error()}, true
-	}
-	if indexVerdict(idxStatus) == "fresh" {
-		// Already current — no rebuild, proceed straight to the guard check.
-		return "fresh", domain.CheckResult{}, false
-	}
 	if os.Getenv("BLUEPRINT_ALLOW_STALE_REBUILD") == "1" {
 		// Explicit opt-in to the legacy rebuild-and-continue behavior: rebuild
 		// once and trust the result without re-verifying convergence.
-		if _, _, err := c.client.IndexBuild(ctx, req.RepositoryRoot); err != nil {
+		if _, _, err := c.client.IndexUpdate(ctx, req.RepositoryRoot); err != nil {
 			return "", domain.CheckResult{Name: c.Name(), Status: domain.StatusError, Error: "stale index and rebuild failed: " + err.Error()}, true
 		}
 		log.Printf("blueprint: BLUEPRINT_ALLOW_STALE_REBUILD=1: rebuilt stale kern index without re-verification (explicit risk opt-in)")
 		return "rebuilt", domain.CheckResult{}, false
 	}
-	// Default path: rebuild once, then re-verify against kern's verdict.
-	if _, _, err := c.client.IndexBuild(ctx, req.RepositoryRoot); err != nil {
-		return "", domain.CheckResult{Name: c.Name(), Status: domain.StatusError, Error: "stale index and rebuild failed: " + err.Error()}, true
-	}
-	recheck, err := c.client.IndexStatus(ctx, req.RepositoryRoot, true)
+	// Default path (P2-4 consolidation): ONE subprocess —
+	// `kern index ensure-fresh --json` — loads the cached index, cheaply
+	// checks staleness (git tree-OID compare, no content walk), updates (or
+	// full-builds) when stale, strictly re-verifies from disk, and fails
+	// closed when the rebuild does not converge. The pre-update probe's
+	// strictness was deliberately redundant: the post-update strict
+	// re-verify is the trust anchor. This replaces the former
+	// probe → IndexUpdate → re-verify-strict → re-verify-loose sequence
+	// (3-4 subprocesses, ~2.6s) with a single subprocess.
+	freshness, err := c.client.EnsureFreshIndex(ctx, req.RepositoryRoot)
 	if err != nil {
-		return "", domain.CheckResult{Name: c.Name(), Status: domain.StatusError, Error: "kern index status unavailable: " + err.Error()}, true
+		if freshness == "stale" {
+			// Stale-non-converging: refuse to pass on a potentially-misleading
+			// index. StatusError is the signal; the finding carries the detail.
+			return "", domain.CheckResult{
+				Name:   c.Name(),
+				Status: domain.StatusError,
+				Findings: []domain.Finding{{
+					RuleID:         "architecture:index-stale",
+					Severity:       domain.SeverityError,
+					Category:       domain.CategoryArchitecture,
+					Message:        "kern index is stale and did not converge after rebuild",
+					Explanation:    "A stale index can hide architecture boundary violations. The rebuild did not produce a fresh index, indicating concurrent edits or index corruption. The check refuses to pass on a potentially-misleading index.",
+					SuggestedFix:   "Run `kern index` manually, ensure no concurrent edits, then re-run blueprint.",
+					RuleVersion:    "1",
+					IndexFreshness: "stale",
+					Confidence:     1.0,
+					Scope:          "repo",
+				}},
+			}, true
+		}
+		return "", domain.CheckResult{Name: c.Name(), Status: domain.StatusError, Error: "kern index ensure-fresh: " + err.Error()}, true
 	}
-	if indexVerdict(recheck) == "fresh" {
-		return "rebuilt", domain.CheckResult{}, false
-	}
-	// The strict verdict recomputes content_root over EVERY file on disk,
-	// while `kern index .` records content for the parseable source set only.
-	// A repo containing an unparseable file (e.g. a deliberately
-	// compile-breaking fixture) therefore never converges under strict — the
-	// build skips the file, strict status counts it. Falling back to the
-	// non-strict verdict before giving up is safe: non-strict freshness is
-	// anchored to the git tree (tree_oid), which is exactly the content the
-	// guard check evaluates. Only when BOTH verdicts are stale do we refuse
-	// to pass on a potentially-misleading index.
-	loose, err := c.client.IndexStatus(ctx, req.RepositoryRoot, false)
-	if err != nil {
-		return "", domain.CheckResult{Name: c.Name(), Status: domain.StatusError, Error: "kern index status unavailable: " + err.Error()}, true
-	}
-	if indexVerdict(loose) == "fresh" {
-		// Strict won't converge, but the tracked tree is fully indexed —
-		// proceed with the rebuilt index.
-		return "rebuilt", domain.CheckResult{}, false
-	}
-	// Stale-non-converging: refuse to pass on a potentially-misleading index.
-	// StatusError is the signal; the finding carries the detail.
-	return "", domain.CheckResult{
-		Name:   c.Name(),
-		Status: domain.StatusError,
-		Findings: []domain.Finding{{
-			RuleID:         "architecture:index-stale",
-			Severity:       domain.SeverityError,
-			Category:       domain.CategoryArchitecture,
-			Message:        "kern index is stale and did not converge after rebuild",
-			Explanation:    "A stale index can hide architecture boundary violations. The rebuild did not produce a fresh index, indicating concurrent edits or index corruption. The check refuses to pass on a potentially-misleading index.",
-			SuggestedFix:   "Run `kern index` manually, ensure no concurrent edits, then re-run blueprint.",
-			RuleVersion:    "1",
-			IndexFreshness: "stale",
-			Confidence:     1.0,
-			Scope:          "repo",
-		}},
-	}, true
+	return freshness, domain.CheckResult{}, false
 }
 
 // authzVerdict asks kern for the change's authorization verdict when it
-// carries an agent identity (P0.4), BEFORE the boundary check. An
+// carries an agent identity, BEFORE the boundary check. An
 // unauthorized agent's structural violations are moot — a denied verdict
 // blocks the change (done=true) and skips the boundary evaluation entirely.
 // Degradation contract (never a hard failure):
-//   - verdict == nil (no --task scope, or kern without the P0.4 authz key):
+//   - verdict == nil (no --task scope, or kern without the authz key):
 //     proceed unchanged (backward compat);
 //   - err != nil (probe failed): emit an authz:verdict-error WARN and
 //     proceed with the boundary check — the architecture check must not
@@ -344,8 +374,8 @@ func (c *ArchitectureCheck) buildGuardFindings(req domain.ChangeRequest, violati
 			Severity:       domain.SeverityWarn,
 			Category:       domain.CategoryArchitecture,
 			Message:        msg,
-			Explanation:    "The guard check runs against the installed kern binary's index. This kern build does not extract Java imports, so Java-only boundary violations would not be reported as blocks.",
-			SuggestedFix:   "Upgrade the kern binary to a build that extracts Java import edges, then re-run the check.",
+			Explanation:    "The guard check runs against the installed kern binary's index, which extracts Java imports (per-file import edges) in addition to call edges, so Java boundary crossings are reported; matching is precise on full package paths (see importMatches).",
+			SuggestedFix:   "Boundary rules match on full package paths; a Java import only violates a rule when its package path is the exact suffix of the forbidden directory.",
 			RuleVersion:    "1",
 			IndexFreshness: freshness,
 			Confidence:     1.0,
@@ -462,85 +492,6 @@ func stagedFilePaths(req domain.ChangeRequest) []string {
 	return files
 }
 
-// indexVerdict extracts the freshness verdict from a `kern index --status
-// --json` payload (KernClient.IndexStatus). The verdict is authoritative:
-// "fresh" means the index reflects current content; anything else — "stale",
-// "unknown", or a missing freshness_proof (built:false, i.e. no index) — is
-// treated as stale (fail-closed: an index whose freshness cannot be proven
-// must not be trusted). The caller compares against "fresh" exactly.
-func indexVerdict(status map[string]any) string {
-	proof, ok := status["freshness_proof"].(map[string]any)
-	if !ok {
-		return "unknown"
-	}
-	v, _ := proof["verdict"].(string)
-	if v == "" {
-		return "unknown"
-	}
-	return v
-}
-
-// Deprecated: P0.2 replaced this with KernClient.IndexStatus (kern's
-// content-addressed FreshnessProof). Retained for reference; do not call.
-//
-// indexIsStale reports whether the kern index at <root>/.kern/index.json is
-// stale relative to the change being validated, meaning it must be rebuilt
-// before the guard check so symbol edges reflect current file content (e.g. a
-// newly-added import).
-//
-// Freshness heuristic (best-effort):
-//   - A missing index.json is always stale.
-//   - The HEAD commit timestamp (git log -1 --format=%ct) is compared to the
-//     index mtime: a commit that landed after the index was built means the
-//     index cannot reflect it.
-//   - Every file in req.Files (repo-relative, joined with root) whose mtime is
-//     newer than the index makes it stale. Stat errors are ignored.
-//   - In strict mode, every path in tracked is checked the same way.
-//
-// Limitation: operations that change file content without updating mtimes
-// (e.g. `git apply` preserving mtimes) can leave a stale index undetected; an
-// explicit `kern index` still refreshes it.
-func indexIsStale(root string, req domain.ChangeRequest, tracked []string) (bool, error) {
-	idxPath := filepath.Join(root, ".kern", "index.json")
-	idxInfo, err := os.Stat(idxPath)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return true, nil // no index -> must build
-		}
-		return false, err
-	}
-	tIdx := idxInfo.ModTime()
-
-	// HEAD commit time: any commit newer than the index invalidates it.
-	if out, err := exec.Command("git", "-C", root, "log", "-1", "--format=%ct").Output(); err == nil {
-		if ct, cerr := strconv.ParseInt(strings.TrimSpace(string(out)), 10, 64); cerr == nil {
-			if time.Unix(ct, 0).After(tIdx) {
-				return true, nil
-			}
-		}
-	}
-
-	// Changed files: a file newer than the index may carry new symbols/imports.
-	for _, f := range req.Files {
-		if fi, serr := os.Stat(filepath.Join(root, f.Path)); serr == nil {
-			if fi.ModTime().After(tIdx) {
-				return true, nil
-			}
-		}
-	}
-
-	// Strict mode also checks every tracked file.
-	for _, p := range tracked {
-		if fi, serr := os.Stat(filepath.Join(root, p)); serr == nil {
-			if fi.ModTime().After(tIdx) {
-				return true, nil
-			}
-		}
-	}
-
-	return false, nil
-}
-
 // gitTrackedFiles returns all files tracked by git in the repo root, via
 // `git ls-files`. Used by strict-baseline mode to check the entire repo
 // (not just working-tree-changed files). Non-go files are filtered out
@@ -603,32 +554,6 @@ func isTestFilePath(rel string) bool {
 
 // --- Projected import check (B6) ---
 
-// boundaryRule mirrors kern's intel.BoundaryRule: one allowed or forbidden
-// dependency edge between two directory/package patterns.
-type boundaryRule struct {
-	From   string `json:"from"`
-	To     string `json:"to"`
-	Action string `json:"action"`
-}
-
-// loadBoundaries reads .kern/boundaries.json into its rule set. A missing or
-// unreadable file yields an error; the caller treats that as "no rules" (the
-// missing-.kern case is already surfaced earlier in Run, and kern's own
-// LoadBoundaries yields an empty rule set for a missing file).
-func loadBoundaries(path string) ([]boundaryRule, error) {
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		return nil, err
-	}
-	var doc struct {
-		Rules []boundaryRule `json:"rules"`
-	}
-	if err := json.Unmarshal(raw, &doc); err != nil {
-		return nil, err
-	}
-	return doc.Rules, nil
-}
-
 // projectedImportFindings implements the pre-write (projected) import check:
 // for every file in the change that is NOT yet on disk (a proposed new file
 // carrying content), it extracts the imports from the proposed content and
@@ -649,8 +574,8 @@ func (c *ArchitectureCheck) projectedImportFindings(req domain.ChangeRequest, fr
 	if req.RepositoryRoot == "" {
 		return nil
 	}
-	rules, err := loadBoundaries(filepath.Join(req.RepositoryRoot, ".kern", "boundaries.json"))
-	if err != nil || len(rules) == 0 {
+	b, err := guard.LoadBoundaries(req.RepositoryRoot)
+	if err != nil || b == nil || len(b.Rules) == 0 {
 		return nil // no declarable rules -> nothing to project
 	}
 
@@ -686,7 +611,7 @@ func (c *ArchitectureCheck) projectedImportFindings(req domain.ChangeRequest, fr
 				if !importMatches(imp, toDir) {
 					continue
 				}
-				rule := forbidVerdict(rules, fromDir, toDir)
+				rule := guard.Verdict(b.Rules, fromDir, toDir)
 				if rule == nil {
 					continue
 				}
@@ -720,7 +645,7 @@ func (c *ArchitectureCheck) projectedImportFindings(req domain.ChangeRequest, fr
 // trees are skipped.
 func sourceDirs(root string) map[string]bool {
 	dirs := map[string]bool{}
-	filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+	_ = filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return nil
 		}
@@ -753,46 +678,6 @@ func importMatches(importPath, dir string) bool {
 		return true
 	}
 	return strings.HasSuffix(importPath, "/"+filepath.Base(dir))
-}
-
-// dirMatch matches a rule pattern against a directory: exact, "pattern/…"
-// prefix, or "…/pattern" suffix (kern's internal/intel/guard.go dirMatch).
-func dirMatch(pattern, dir string) bool {
-	if pattern == "" {
-		return false
-	}
-	return dir == pattern ||
-		strings.HasPrefix(dir, pattern+"/") ||
-		strings.HasSuffix(dir, "/"+pattern)
-}
-
-// normalizeGlob reduces a self-or-descendant glob ("web/**", "web/...") to its
-// base so dirMatch can evaluate it (kern's normalizeGlob).
-func normalizeGlob(pattern string) string {
-	if strings.HasSuffix(pattern, "/**") {
-		return strings.TrimSuffix(pattern, "/**")
-	}
-	if strings.HasSuffix(pattern, "/...") {
-		return strings.TrimSuffix(pattern, "/...")
-	}
-	return pattern
-}
-
-// forbidVerdict returns the forbidding rule for the fromDir -> toDir edge, or
-// nil when the edge is permitted. Mirrors kern's verdict: an allow rule
-// dominates any forbid rule for the same pair, order-invariant.
-func forbidVerdict(rules []boundaryRule, fromDir, toDir string) *boundaryRule {
-	for i := range rules {
-		if rules[i].Action == "allow" && dirMatch(normalizeGlob(rules[i].From), fromDir) && dirMatch(normalizeGlob(rules[i].To), toDir) {
-			return nil
-		}
-	}
-	for i := range rules {
-		if rules[i].Action == "forbid" && dirMatch(normalizeGlob(rules[i].From), fromDir) && dirMatch(normalizeGlob(rules[i].To), toDir) {
-			return &rules[i]
-		}
-	}
-	return nil
 }
 
 // Import-extraction regexes. These capture the same import signal kern's index

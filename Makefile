@@ -1,6 +1,6 @@
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 
-LDFLAGS := -ldflags "-X github.com/JayveerPrajapati/blueprint/internal/blueprint/version.Version=$(VERSION)"
+LDFLAGS := -ldflags "-X github.com/JayveerPrajapati/blueprint/internal/bpreceipt/version.Version=$(VERSION)"
 
 .PHONY: build install test test-gates vet fmt fmt-check lint mcpb
 
@@ -19,16 +19,16 @@ test:
 test-gates:
 	@if command -v kern >/dev/null 2>&1; then \
 		echo "Using kern from PATH: $$(command -v kern)"; \
-		KERN_BINARY="$$(command -v kern)" go test -count=1 -timeout 600s ./cmd/blueprint ./internal/blueprint/adapters/kern ./internal/blueprint/metrics; \
+		KERN_BINARY="$$(command -v kern)" go test -count=1 -timeout 600s ./cmd/blueprint ./internal/blueprint/adapters/kern ./internal/bpreceipt/metrics; \
 	elif [ -x "$$HOME/.local/bin/kern" ]; then \
 		echo "Using kern from ~/.local/bin/kern"; \
-		KERN_BINARY="$$HOME/.local/bin/kern" go test -count=1 -timeout 600s ./cmd/blueprint ./internal/blueprint/adapters/kern ./internal/blueprint/metrics; \
+		KERN_BINARY="$$HOME/.local/bin/kern" go test -count=1 -timeout 600s ./cmd/blueprint ./internal/blueprint/adapters/kern ./internal/bpreceipt/metrics; \
 	elif [ -x "../kern/bin/kern" ]; then \
 		echo "Using kern from ../kern/bin/kern"; \
-		KERN_BINARY="$$(cd .. && pwd)/kern/bin/kern" go test -count=1 -timeout 600s ./cmd/blueprint ./internal/blueprint/adapters/kern ./internal/blueprint/metrics; \
+		KERN_BINARY="$$(cd .. && pwd)/kern/bin/kern" go test -count=1 -timeout 600s ./cmd/blueprint ./internal/blueprint/adapters/kern ./internal/bpreceipt/metrics; \
 	else \
 		echo "kern not found (PATH, ~/.local/bin, ../kern/bin) — gate tests will skip"; \
-		go test -count=1 -timeout 600s ./cmd/blueprint ./internal/blueprint/adapters/kern ./internal/blueprint/metrics; \
+		go test -count=1 -timeout 600s ./cmd/blueprint ./internal/blueprint/adapters/kern ./internal/bpreceipt/metrics; \
 	fi
 
 .PHONY: mcpb

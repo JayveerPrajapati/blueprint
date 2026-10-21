@@ -23,14 +23,14 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/JayveerPrajapati/blueprint/internal/blueprint/version"
+	"github.com/JayveerPrajapati/blueprint/internal/bpreceipt/version"
 )
 
 // KernContractVersion is the version of the JSON contract Blueprint expects
 // from `kern guard check --json` and `kern sec --json`. kern emits
 // {"schema_version":2,"violations":[...]},
 // {"schema_version":2,"findings":[...]}, and — when the change carries an
-// agent identity — an "authz_verdict" object (P0.4) since this version.
+// agent identity — an "authz_verdict" object since this version.
 // Blueprint fails closed on any missing/wrong/malformed contract so a
 // version skew surfaces as an ERROR rather than a silent misparse.
 const KernContractVersion = 2
@@ -60,8 +60,8 @@ type SecFinding struct {
 	Snippet  string `json:"snippet"`
 }
 
-// AuthzVerdict is kern's authorization verdict for an agent-sourced change
-// (P0.4), carried in the v2 `kern guard check --json` payload under the
+// AuthzVerdict is kern's authorization verdict for an agent-sourced change,
+// carried in the v2 `kern guard check --json` payload under the
 // "authz_verdict" key. Decision is "allowed" | "denied" | "unknown";
 // PolicySource says which policy produced it ("default-scoped" |
 // "task-scope" | "permissive-default"). DeniedFiles lists the paths the
@@ -189,13 +189,18 @@ func resolveKernBinary() (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("kern binary not found: %w", err)
 	}
-	candidate := filepath.Join(cwd, "..", "kern", "bin", "kern")
-	if info, err := os.Stat(candidate); err == nil && !info.IsDir() {
-		return candidate, nil
+	candidates := []string{
+		filepath.Join(cwd, "bin", "kern"),
+		filepath.Join(cwd, "..", "kern", "bin", "kern"),
+	}
+	for _, candidate := range candidates {
+		if info, err := os.Stat(candidate); err == nil && !info.IsDir() {
+			return candidate, nil
+		}
 	}
 	// Not found — attempt automatic install.
 	if installErr := installKern(); installErr != nil {
-		return "", fmt.Errorf("kern binary not found: set KERN_BINARY, add kern to $PATH, or place it at %s (auto-install failed: %v)", candidate, installErr)
+		return "", fmt.Errorf("kern binary not found: set KERN_BINARY, add kern to $PATH, or place it at %s (auto-install failed: %v)", candidates[0], installErr)
 	}
 	// Re-resolve after install: go install puts binaries in $(go env GOPATH)/bin.
 	if p, err := exec.LookPath("kern"); err == nil {
@@ -262,10 +267,11 @@ func execCommand(ctx context.Context, name string, args []string, workdir string
 // GuardCheck runs `kern guard check --json` in workdir and returns the parsed
 // violations, the raw stdout, and the process exit code.
 //
-// Exit codes 0 (clean) and 2 (violations found) are results, not errors: both
-// parse their JSON output and return it. Any other exit code is a tool
-// failure and is returned as an error. workdir must be the repository root so
-// kern finds .kern/boundaries.json.
+// Exit codes 0 (clean), 2 (legacy violations, pre-L5 kern), and 3 (denied /
+// violations found, current kern) are results, not errors: all three parse
+// their JSON output and return it. Any other exit code is a tool failure and
+// is returned as an error. workdir must be the repository root so kern finds
+// .kern/boundaries.json.
 //
 // With no files argument, kern uses ChangedFiles(root) which includes both
 // staged and unstaged git changes. Use GuardCheckFiles to scope to specific
@@ -275,7 +281,7 @@ func (c *KernClient) GuardCheck(ctx context.Context, workdir string) (violations
 	if runErr != nil {
 		return nil, out, code, fmt.Errorf("kern guard check: %w", runErr)
 	}
-	if code != 0 && code != 2 {
+	if code != 0 && code != 2 && code != 3 {
 		return nil, out, code, fmt.Errorf("kern guard check failed (exit %d): %s", code, strings.TrimSpace(errOut))
 	}
 	var payload struct {
@@ -330,7 +336,7 @@ func (c *KernClient) GuardCheckFiles(ctx context.Context, workdir string, files 
 		if runErr != nil {
 			return allViolations, strings.Join(stdoutParts, "\n"), exitCode, fmt.Errorf("kern guard check (batch %d-%d): %w", i+1, end, runErr)
 		}
-		if code != 0 && code != 2 {
+		if code != 0 && code != 2 && code != 3 {
 			return allViolations, strings.Join(stdoutParts, "\n"), exitCode, fmt.Errorf("kern guard check failed (exit %d, batch %d-%d): %s", code, i+1, end, strings.TrimSpace(errOut))
 		}
 		var payload struct {
@@ -349,7 +355,7 @@ func (c *KernClient) GuardCheckFiles(ctx context.Context, workdir string, files 
 }
 
 // AuthzVerdict returns kern's authorization verdict for an agent-sourced
-// change (P0.4). It runs `kern guard check --file <files> --agent-id <id>
+// change. It runs `kern guard check --file <files> --agent-id <id>
 // --task <task> --json` in workdir and parses the "authz_verdict" object out
 // of the v2 output.
 //
@@ -359,15 +365,15 @@ func (c *KernClient) GuardCheckFiles(ctx context.Context, workdir string, files 
 // without authz (backward compat with older kern builds and non-agent
 // flows).
 //
-// Exit code 2 is a RESULT, not an error: kern exits 2 both for boundary
-// violations and for a "denied" authz verdict. Only a launch failure, a
-// non-zero-non-2 exit, or a JSON/contract parse error is an error. The
-// contract is fail-closed: a missing or wrong schema_version errors rather
-// than silently misparsing.
+// Exit codes 2 (legacy, pre-L5 kern) and 3 (denied, current kern) are RESULTS,
+// not errors: kern exits 2/3 both for boundary violations and for a "denied"
+// authz verdict. Only a launch failure, a non-zero-non-2-non-3 exit, or a
+// JSON/contract parse error is an error. The contract is fail-closed: a
+// missing or wrong schema_version errors rather than silently misparsing.
 func (c *KernClient) AuthzVerdict(ctx context.Context, workdir, agentID, task string, files []string) (*AuthzVerdict, error) {
 	if agentID == "" || task == "" || len(files) == 0 {
 		// No agent identity, no task scope, or no files to authorize: kern's
-		// guard requires --agent-id AND --task together (its P0.4 usage
+		// guard requires --agent-id AND --task together (its usage
 		// rule), and with nothing to authorize there is no verdict. The
 		// caller proceeds without authz.
 		return nil, nil
@@ -378,7 +384,7 @@ func (c *KernClient) AuthzVerdict(ctx context.Context, workdir, agentID, task st
 	if runErr != nil {
 		return nil, fmt.Errorf("kern guard check authz: %w", runErr)
 	}
-	if code != 0 && code != 2 {
+	if code != 0 && code != 2 && code != 3 {
 		return nil, fmt.Errorf("kern guard check authz failed (exit %d): %s", code, strings.TrimSpace(errOut))
 	}
 	var payload struct {
@@ -414,6 +420,39 @@ func (c *KernClient) IndexBuild(ctx context.Context, workdir string) (stdout str
 	return out, code, nil
 }
 
+// IndexUpdate runs `kern index --update <root>` in workdir: an INCREMENTAL
+// refresh of the persisted index. kern loads the cached .kern/index.json and,
+// when stale, runs index.Update — re-parsing only changed/new files and
+// copying symbols/edges of unchanged files verbatim — so a small commit does
+// not invalidate the whole index (a 2-file change re-parses 2 files, not the
+// repo). It falls back to a full build when no previous index exists or the
+// incremental update fails, and saves the result before returning. The result
+// is equivalent to a full rebuild, so freshness verdicts (index status)
+// behave identically after it returns.
+//
+// An installed kern that predates `index --update` rejects the flag with a
+// non-zero exit; IndexUpdate then degrades to the legacy explicit full
+// rebuild (`kern index .`) — strictly more work, but the same fresh-index
+// result. ensureFreshIndex's re-verify-and-fail-closed contract still applies
+// to whatever this method returns, so the degradation can never turn a stale
+// index into a silent pass.
+func (c *KernClient) IndexUpdate(ctx context.Context, workdir string) (stdout string, exitCode int, err error) {
+	out, _, code, runErr := c.runner(ctx, c.binaryPath, []string{"index", "--update", "."}, workdir)
+	if runErr == nil && code == 0 {
+		return out, code, nil
+	}
+	// Older kern: `index --update` is an unknown flag (non-zero exit). Fall
+	// back to the full rebuild command so the guard still works unmodified.
+	out, errOut, code, runErr := c.runner(ctx, c.binaryPath, []string{"index", "."}, workdir)
+	if runErr != nil {
+		return out, code, fmt.Errorf("kern index --update: %w", runErr)
+	}
+	if code != 0 {
+		return out, code, fmt.Errorf("kern index --update (legacy `kern index .` fallback) failed (exit %d): %s", code, strings.TrimSpace(errOut))
+	}
+	return out, code, nil
+}
+
 // IndexStatus calls `kern index --status --json [--strict]` in root and
 // returns the parsed status payload. strict=true requests the
 // untracked-file-aware freshness proof: kern recomputes content_root over
@@ -421,7 +460,7 @@ func (c *KernClient) IndexBuild(ctx context.Context, workdir string) (stdout str
 //
 // The payload is schema-versioned (schema_version is the STRING "2"); a
 // missing or mismatched version is a contract skew and fails closed, so an
-// older kern without the P0.2 freshness contract surfaces as an ERROR rather
+// older kern without the freshness contract surfaces as an ERROR rather
 // than a silent misparse. In the payload, top-level "stale" is false exactly
 // when freshness_proof.verdict is "fresh"; when built is false (no index),
 // both freshness_proof and index_identity are omitted, and the caller treats
@@ -448,10 +487,61 @@ func (c *KernClient) IndexStatus(ctx context.Context, root string, strict bool) 
 	return status, nil
 }
 
+// EnsureFreshIndex runs `kern index ensure-fresh --json` in root and returns
+// the freshness verdict ("fresh" | "rebuilt"). This is the Phase 2
+// consolidation of the former probe(strict) → update → re-verify(strict) →
+// loose-check subprocess sequence into ONE invocation: kern loads the cached
+// index, cheaply checks staleness via the git tree OID (no content walk),
+// updates (or full-builds when no index loads) when stale, re-verifies
+// strictly from disk, and fails closed when the rebuild does not converge.
+//
+// Exit code 2 is a RESULT, not an error: kern exits 2 exactly when the index
+// is stale and did not converge, and still prints the JSON payload. A launch
+// failure, any other exit code, an unparseable payload, a schema_version
+// skew, or a "stale" verdict all fail closed and return an error — a
+// non-converged index must never be reported as usable. On the stale path the
+// returned freshness is still "stale" so callers can distinguish
+// non-convergence (emit an architecture:index-stale finding) from a tool
+// failure.
+func (c *KernClient) EnsureFreshIndex(ctx context.Context, root string) (freshness string, err error) {
+	out, errOut, code, runErr := c.runner(ctx, c.binaryPath, []string{"index", "ensure-fresh", "--json"}, root)
+	if runErr != nil {
+		return "", fmt.Errorf("kern index ensure-fresh: %w", runErr)
+	}
+	if code != 0 && code != 2 {
+		return "", fmt.Errorf("kern index ensure-fresh failed (exit %d): %s", code, strings.TrimSpace(errOut))
+	}
+	var payload struct {
+		SchemaVersion  string         `json:"schema_version"`
+		Freshness      string         `json:"freshness"`
+		FreshnessProof map[string]any `json:"freshness_proof"`
+	}
+	if err := json.Unmarshal([]byte(out), &payload); err != nil {
+		return "", fmt.Errorf("kern index ensure-fresh: parse output: %w", err)
+	}
+	if payload.SchemaVersion != "2" {
+		return "", fmt.Errorf("kern index ensure-fresh: schema_version %q, want 2", payload.SchemaVersion)
+	}
+	verdict := ""
+	if v, ok := payload.FreshnessProof["verdict"].(string); ok {
+		verdict = v
+	}
+	switch payload.Freshness {
+	case "fresh", "rebuilt":
+		if verdict != "" && verdict != "fresh" {
+			return "", fmt.Errorf("kern index ensure-fresh: freshness %q but verdict %q — index did not converge", payload.Freshness, verdict)
+		}
+		return payload.Freshness, nil
+	default:
+		// "stale" (or an unknown value): fail closed.
+		return payload.Freshness, fmt.Errorf("kern index ensure-fresh: index did not converge after rebuild (freshness %q, verdict %q)", payload.Freshness, verdict)
+	}
+}
+
 // SecScan runs `kern sec --json <path>` in workdir and returns the parsed
 // findings, the raw stdout, and the process exit code.
 //
-// Exit codes 0 (clean) and 1 (findings found) are results, not errors.
+// Exit codes 0 (clean) and 1 are results, not errors.
 // Because kern also uses exit code 1 for tool errors, stderr presence
 // distinguishes the two: exit 1 with non-empty stderr is a tool failure and
 // is returned as an error.
@@ -460,10 +550,13 @@ func (c *KernClient) SecScan(ctx context.Context, workdir, path string) (finding
 	if runErr != nil {
 		return nil, out, code, fmt.Errorf("kern sec: %w", runErr)
 	}
-	if code != 0 && code != 1 {
+	// Exit contract: 0 = clean, 1 = findings (fatalFindings — the findings
+	// tier; same drift the plugin shadows hit, F-RV1 class).
+	// Both carry the findings JSON on stdout; only other codes are errors.
+	if code != 0 && code != 1 && code != 3 {
 		return nil, out, code, fmt.Errorf("kern sec failed (exit %d): %s", code, strings.TrimSpace(errOut))
 	}
-	if code == 1 && strings.TrimSpace(errOut) != "" {
+	if (code == 1 || code == 3) && strings.TrimSpace(errOut) != "" {
 		// Tool error, not a findings result.
 		return nil, out, code, fmt.Errorf("kern sec: %s", strings.TrimSpace(errOut))
 	}

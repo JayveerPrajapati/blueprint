@@ -9,8 +9,8 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/JayveerPrajapati/blueprint/internal/blueprint/mcp"
-	blueprintversion "github.com/JayveerPrajapati/blueprint/internal/blueprint/version"
+	"github.com/JayveerPrajapati/blueprint/internal/bpcli/mcp"
+	blueprintversion "github.com/JayveerPrajapati/blueprint/internal/bpreceipt/version"
 )
 
 func main() {

@@ -81,7 +81,7 @@ You should see output like:
 blueprint <version>
 ```
 
-The version is injected at build time via ldflags (`-X .../version.Version=...`); a plain `go build` prints `dev`. See the [Makefile](../Makefile) for the canonical build with version injection.
+The version is injected at build time via ldflags (`-X github.com/JayveerPrajapati/blueprint/internal/bpreceipt/version.Version=...`); a plain `go build` prints `dev`. See the [Makefile](../Makefile) for the canonical build with version injection.
 
 Then run a full check against a repository with staged changes:
 

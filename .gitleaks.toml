@@ -1,0 +1,16 @@
+title = "gitleaks config"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Ignore synthetic secrets in tests, fixtures, and local caches"
+paths = [
+    '''(^|/)fixtures_.*$''',
+    '''(^|/)fixture_.*$''',
+    '''(^|/).*_test\.go$''',
+    '''(^|/)test_.*$''',
+    '''(^|/)fixtures/.*$''',
+    '''^\.blueprint/.*$''',
+    '''(^|/)\.kern/.*$'''
+]

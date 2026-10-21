@@ -66,4 +66,4 @@ jobs:
           go install github.com/zricethezav/gitleaks/v8@latest
           echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
       - name: Gate tests (G0-G13 with real kern)
-        run: go test -count=1 -timeout 600s ./cmd/blueprint ./internal/blueprint/adapters/kern ./internal/blueprint/metrics
+        run: go test -count=1 -timeout 600s ./cmd/blueprint ./internal/blueprint/adapters/kern ./internal/bpreceipt/metrics

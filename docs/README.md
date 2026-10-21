@@ -57,11 +57,14 @@ The enforcement chain is **hook + CI + protected branch**: the hook catches viol
 
 ```text
 blueprint version                        Print the version
+blueprint doctor [--repo DIR] [--json]   Preflight environment / configuration diagnostic
 blueprint check [--staged] [--format=terminal|json] [--json] [--tests] [--resilience] [--isolate-network] [--allow-unisolated] [--require-kern]
 blueprint install hook                   Install a pre-commit hook
 blueprint watch [--strict] [--policy architecture,secrets] [--interval] [--debounce]
 blueprint ci [--repo DIR] [--base main] [--head HEAD] [--artifact-file FILE] [--json] [--no-human] [--strict-latency]
 blueprint metrics [--repo DIR] [--json] [--reset]
+blueprint graph [--repo DIR] [--format mermaid|dot|json] [--output FILE]
+               Print the architectural boundary graph for the repo
 blueprint fix [--repo DIR] [--file FILE] [--content ...]
                Validate agent-proposed fixes in an isolated worktree
 blueprint verify-receipt [--repo DIR]
