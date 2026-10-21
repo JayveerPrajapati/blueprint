@@ -712,7 +712,7 @@ func resolveBinary() (string, []string) {
 // check's own state, VCS metadata, and common vendored/heavy build trees that
 // jscpd should never treat as comparison corpus.
 var excludedDirs = map[string]bool{
-	".git": true, ".blueprint": true, "node_modules": true, "vendor": true,
+	".git": true, ".blueprint": true, ".kern": true, "node_modules": true, "vendor": true,
 	".venv": true, "venv": true, "dist": true, "build": true, "target": true,
 	"coverage": true, "Pods": true, ".build": true, ".cache": true,
 	".gradle": true, ".idea": true, ".vscode": true, "__pycache__": true,

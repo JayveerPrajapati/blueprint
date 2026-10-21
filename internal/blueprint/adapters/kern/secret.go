@@ -212,6 +212,10 @@ func (c *SecretCheck) scanContent(ctx context.Context, contentFiles []domain.Fil
 			continue
 		}
 
+		if isSuppressedCanonicalSecret(sf, tmpDir) {
+			continue
+		}
+
 		findings = append(findings, c.findingFromSec(sf))
 	}
 	return findings, nil
@@ -320,9 +324,49 @@ func (c *SecretCheck) scanDisk(ctx context.Context, req domain.ChangeRequest, di
 			continue
 		}
 
+		if isSuppressedCanonicalSecret(sf, req.RepositoryRoot) {
+			continue
+		}
+
 		findings = append(findings, c.findingFromSec(sf))
 	}
 	return findings, nil
+}
+
+// knownCanonicalSecrets holds literal fake secrets published in vendor
+// documentation (e.g. AWS's example key pair) or contract fixtures.
+// If an older kern returns findings for these lines/snippets, Blueprint
+// suppresses them here to remain resilient across kern releases.
+var knownCanonicalSecrets = map[string]bool{
+	"AKIAIOSFODNN7EXAMPLE":                     true,
+	"wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY": true,
+	"sk-abc123": true,
+}
+
+func isSuppressedCanonicalSecret(sf SecFinding, repoRoot string) bool {
+	if sf.Snippet != "" {
+		for secret := range knownCanonicalSecrets {
+			if strings.Contains(sf.Snippet, secret) {
+				return true
+			}
+		}
+	}
+	if repoRoot != "" && sf.File != "" && sf.Line > 0 {
+		filePath := filepath.Join(repoRoot, sf.File)
+		data, err := os.ReadFile(filePath)
+		if err == nil {
+			lines := strings.Split(string(data), "\n")
+			if sf.Line <= len(lines) {
+				lineText := lines[sf.Line-1]
+				for secret := range knownCanonicalSecrets {
+					if strings.Contains(lineText, secret) {
+						return true
+					}
+				}
+			}
+		}
+	}
+	return false
 }
 
 // findingFromSec maps one kern sec finding into a domain.Finding. Redaction
